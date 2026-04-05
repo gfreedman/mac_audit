@@ -1,17 +1,42 @@
 """
-Developer environment checks.
+Developer environment health checks.
 
-Approach: simplified PATH-focused checks only, per spec.
-Do NOT recursively search filesystem for every installation.
-Just flag what's visible in PATH and well-known home directories.
+This module implements six checks targeting common developer toolchain
+configurations that lead to hard-to-debug environment issues on macOS.
+The philosophy is **PATH-focused**: checks look at what is visible in ``PATH``
+and well-known home-directory locations, rather than exhaustively scanning the
+filesystem for every possible installation.
+
+Rationale:
+    A filesystem-wide search (e.g. ``find / -name python3``) would be slow,
+    noisy, and produce false positives for virtual environments and Docker
+    volumes.  Checking ``PATH`` and a small set of well-known directories
+    matches what the shell actually resolves at runtime.
 
 Checks:
-  - XcodeToolsCheck      — Xcode Command Line Tools installed
-  - PythonConflictsCheck — multiple python3 in PATH
-  - CondaCheck           — conda auto-activation conflicts
-  - NodeManagerCheck     — Node version manager(s) detected
-  - RubyConflictsCheck   — system ruby first in PATH
-  - GitConfigCheck       — user identity and credential helper
+    - :class:`XcodeToolsCheck`      — Xcode Command Line Tools installed and
+                                      version visible.
+    - :class:`PythonConflictsCheck` — Multiple ``python3`` binaries in PATH
+                                      that can cause package installation
+                                      confusion.
+    - :class:`CondaCheck`           — Conda ``auto_activate_base`` setting that
+                                      silently overrides the default Python.
+    - :class:`NodeManagerCheck`     — Multiple Node.js version managers (nvm,
+                                      volta, fnm, n) installed simultaneously.
+    - :class:`RubyConflictsCheck`   — System Ruby (``/usr/bin/ruby``) first in
+                                      PATH, breaking ``gem install`` workflows.
+    - :class:`GitConfigCheck`       — Git global user identity and plaintext
+                                      credential helper detection.
+
+Attributes:
+    ALL_CHECKS (list[type[BaseCheck]]): Ordered list of check classes exported
+        to the scan orchestrator.  All checks use
+        ``profile_tags = ("developer",)`` and therefore run only under the
+        ``developer`` profile (auto-detected when Homebrew is installed).
+
+Note:
+    All subprocess calls use ``self.shell()``, which enforces ``LANG=C``
+    and ``LC_ALL=C`` for consistent English output regardless of locale.
 """
 
 from __future__ import annotations
@@ -59,6 +84,22 @@ class XcodeToolsCheck(BaseCheck):
     fix_time_estimate = "~5 minutes"
 
     def run(self) -> CheckResult:
+        """Confirm CLTools installation via ``xcode-select -p`` and retrieve the version.
+
+        Runs ``xcode-select -p`` to check whether the active developer directory
+        is set.  A non-zero exit code means CLTools are not installed.  If
+        installed, the check queries ``pkgutil`` for the
+        ``com.apple.pkg.CLTools_Executables`` package to extract the version
+        string shown in the result message.
+
+        Returns:
+            CheckResult: A result with one of the following statuses:
+
+            - ``"warning"`` — CLTools are not installed; many developer tools
+              will be broken or absent.
+            - ``"pass"`` — CLTools are installed; version is shown if detectable
+              via ``pkgutil``.
+        """
         rc, path_out, _ = self.shell(["xcode-select", "-p"])
 
         if rc != 0:
@@ -121,7 +162,23 @@ class PythonConflictsCheck(BaseCheck):
     fix_time_estimate = "~10 minutes"
 
     def run(self) -> CheckResult:
-        """Run `which -a python3` and warn if more than one unique path is found."""
+        """Run ``which -a python3`` and warn if more than one unique binary path is returned.
+
+        ``which -a`` lists **all** matching executables in ``PATH`` in order.
+        Duplicate paths are de-duplicated via a dict (preserving order).
+        If the de-duplicated list has more than one entry it means different
+        directories in ``PATH`` each contain a different ``python3`` binary —
+        the classic conflict scenario.
+
+        Returns:
+            CheckResult: A result with one of the following statuses:
+
+            - ``"info"`` — no ``python3`` found in PATH at all.
+            - ``"pass"`` — exactly one unique ``python3`` path in PATH;
+              active version string is shown.
+            - ``"warning"`` — two or more unique ``python3`` paths; the count
+              and active version are shown.
+        """
         rc, out, _ = self.shell(["which", "-a", "python3"])
         if rc != 0 or not out.strip():
             return self._info("python3 not found in PATH")
@@ -189,7 +246,28 @@ class CondaCheck(BaseCheck):
     ]
 
     def run(self) -> CheckResult:
-        """Scan well-known conda directories and PATH; check auto_activate_base config if present."""
+        """Scan well-known conda directories and PATH; check ``auto_activate_base`` if conda is present.
+
+        Detection proceeds in two phases:
+
+        1. **Directory scan** — checks each path in ``_CONDA_DIRS`` (relative to
+           ``~``) and ``_CONDA_SYSTEM_DIRS`` (absolute system paths) for a
+           directory that exists.
+        2. **Command probe** — checks whether ``conda`` is in ``PATH``.
+
+        If conda is detected, ``conda config --show auto_activate_base`` is
+        called to read the current setting.  A missing or inaccessible config
+        is treated as "auto-activate is on" (the conda default).
+
+        Returns:
+            CheckResult: A result with one of the following statuses:
+
+            - ``"pass"`` — no conda installation detected.
+            - ``"warning"`` — conda detected and ``auto_activate_base`` is
+              ``True``; every new shell will activate the base environment.
+            - ``"info"`` — conda detected but ``auto_activate_base`` is
+              ``False``; no PATH override on shell start.
+        """
         home = os.path.expanduser("~")
         found_paths = []
 
@@ -267,7 +345,25 @@ class NodeManagerCheck(BaseCheck):
     fix_time_estimate = "~10 minutes"
 
     def run(self) -> CheckResult:
-        """Check ~/.nvm, ~/.volta directories and PATH for fnm/n; report current Node version."""
+        """Detect Node version managers by directory and PATH probe; warn if multiple are found.
+
+        Detection strategy per manager:
+          - **nvm**: checks for the ``~/.nvm/`` directory (nvm is a shell
+            function, not a standalone binary, so PATH alone is insufficient).
+          - **volta**: checks for the ``~/.volta/`` directory.
+          - **fnm**, **n**: checks for the binary name in ``PATH`` via
+            ``shutil.which``.
+
+        If exactly one manager is found, the current ``node --version`` output
+        is retrieved for the result message.  If no manager is found but Node is
+        in PATH, that is reported as ``info`` without a warning.
+
+        Returns:
+            CheckResult: A result with one of the following statuses:
+
+            - ``"info"`` — no Node.js detected, or one manager installed cleanly.
+            - ``"warning"`` — two or more managers are installed simultaneously.
+        """
         home = os.path.expanduser("~")
         found = []
 
@@ -351,7 +447,25 @@ class RubyConflictsCheck(BaseCheck):
     fix_time_estimate = "~5 minutes"
 
     def run(self) -> CheckResult:
-        """Run `which -a ruby` and warn if /usr/bin/ruby precedes Homebrew or rbenv ruby."""
+        """Run ``which -a ruby`` and warn if ``/usr/bin/ruby`` is first in the resolved list.
+
+        ``which -a ruby`` returns every ``ruby`` binary found in ``PATH`` in
+        order.  If the first entry is ``/usr/bin/ruby`` **and** at least one
+        other Ruby exists (meaning the user has a non-system Ruby installed but
+        it is not first in PATH), a warning is issued.
+
+        If ``/usr/bin/ruby`` is the *only* Ruby, an informational result is
+        returned suggesting installation of Homebrew Ruby for gem work.
+
+        Returns:
+            CheckResult: A result with one of the following statuses:
+
+            - ``"info"`` — ``ruby`` not found in PATH.
+            - ``"info"`` — only system Ruby found; no managed Ruby installed.
+            - ``"warning"`` — system Ruby is first but a better Ruby exists
+              later in PATH (not being used).
+            - ``"pass"`` — a non-system Ruby is first in PATH; version shown.
+        """
         rc, out, _ = self.shell(["which", "-a", "ruby"])
         if rc != 0 or not out.strip():
             return self._info("ruby not found in PATH")
@@ -426,7 +540,26 @@ class GitConfigCheck(BaseCheck):
     fix_time_estimate = "~2 minutes"
 
     def run(self) -> CheckResult:
-        """Parse `git config --global -l` for user.name, user.email, and credential.helper."""
+        """Parse ``git config --global -l`` for identity fields and credential helper security.
+
+        Runs ``git config --global -l`` and builds a ``{key: value}`` dict from
+        all lines.  Three fields are checked:
+
+        1. ``user.name`` — must be present for commits to be correctly attributed.
+        2. ``user.email`` — must be present for commits to be correctly attributed.
+        3. ``credential.helper`` — ``"store"`` stores credentials in a plaintext
+           file (``~/.git-credentials``), which is a security risk.
+           ``"osxkeychain"`` uses the encrypted macOS Keychain and is safe.
+
+        Returns:
+            CheckResult: A result with one of the following statuses:
+
+            - ``"skip"`` — git is not installed.
+            - ``"warning"`` — global config absent, or one or more of the three
+              checks failed; issues are listed in the message.
+            - ``"pass"`` — name and email are set; credential helper is not
+              ``"store"``; active configuration is shown.
+        """
         if not self.has_tool("git"):
             return self._skip("git not installed")
 

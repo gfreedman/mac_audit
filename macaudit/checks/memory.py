@@ -1,11 +1,43 @@
 """
-Memory and performance checks.
+Memory and performance checks for Mac Audit.
+
+This module implements four checks that examine RAM utilisation, virtual memory
+swap usage, and process-level CPU and memory consumption. Together they help the
+user understand why their Mac may feel slow and identify the processes responsible.
+
+Design decisions:
+    - Process data is collected once via a single ``ps -eo pid,pcpu,pmem,comm``
+      call and parsed by the shared ``_parse_ps()`` helper. Both ``TopCPUCheck``
+      and ``TopMemoryCheck`` call ``ps`` independently rather than sharing a
+      cache, because each check runs in isolation and the data changes rapidly
+      enough that a stale cache would not be useful.
+    - Memory pressure is queried via the ``memory_pressure`` CLI tool rather than
+      a raw sysctl because the tool encodes Apple's own multi-factor assessment
+      (not merely the percentage of RAM in use). The output format is undocumented
+      and varies between macOS releases, so the parser uses a two-pass strategy:
+      first a structured-line pass, then a colour-word fallback.
+    - Swap usage is quantified via ``sysctl vm.swapusage`` rather than inspecting
+      the ``/private/var/vm/swapfile*`` files directly. The sysctl gives an
+      authoritative summary without requiring elevated privileges.
+    - ``_short_name()`` truncates process command paths to 24 characters to keep
+      report lines readable. The command value from ``ps`` may be a full absolute
+      path (e.g. ``/Applications/Safari.app/Contents/MacOS/Safari``), so only
+      the basename is needed.
 
 Checks:
-  - MemoryPressureCheck — system memory pressure level (green/yellow/red)
-  - SwapUsageCheck      — swap file usage
-  - TopCPUCheck         — top 5 CPU-consuming processes
-  - TopMemoryCheck      — top 5 memory-consuming processes
+    - :class:`MemoryPressureCheck` — system memory pressure level (green/yellow/red).
+    - :class:`SwapUsageCheck`      — virtual memory swap file usage in GB.
+    - :class:`TopCPUCheck`         — top 5 CPU-consuming processes; warn if any ≥90%.
+    - :class:`TopMemoryCheck`      — top 5 memory-consuming processes for visibility.
+
+Attributes:
+    ALL_CHECKS (list[type[BaseCheck]]): Ordered list of check classes exported
+        to the scan orchestrator.
+
+Note:
+    All subprocess calls use ``self.shell()``, which forces ``LANG=C`` and
+    ``LC_ALL=C`` to ensure consistent English-language output regardless of
+    the user's system locale setting.
 """
 
 from __future__ import annotations
@@ -18,7 +50,43 @@ from macaudit.checks.base import BaseCheck, CheckResult
 # ── Memory pressure ───────────────────────────────────────────────────────────
 
 class MemoryPressureCheck(BaseCheck):
-    """Report macOS memory pressure level (green/yellow/red) via the memory_pressure CLI."""
+    """Report macOS memory pressure level (green/yellow/red) via the ``memory_pressure`` CLI.
+
+    macOS computes memory pressure using a multi-factor algorithm that considers
+    not just raw RAM utilisation but also the rate of pageouts, compressed memory
+    size, swap activity, and wired memory. The result is expressed as one of three
+    levels that correspond to traffic-light colours:
+
+    - **Green (Normal)**: RAM is ample; no paging pressure.
+    - **Yellow (Warning)**: Memory is being actively managed; performance may
+      degrade under additional load. The Compressed Memory system is working hard.
+    - **Red (Critical)**: The system is swapping heavily to disk. App launch times
+      increase dramatically; the system may feel unresponsive.
+
+    Detection mechanism:
+        Runs the ``memory_pressure`` command-line tool, which is provided by macOS
+        and reports the same level shown in Activity Monitor's Memory Pressure graph.
+        The output format has changed across macOS versions, so the parser uses a
+        two-pass approach: a structured ``"System memory pressure level: …"`` line
+        is checked first, then a fallback scans for raw colour words
+        (``"red"``, ``"yellow"``, ``"green"``).
+
+    Attributes:
+        id (str): ``"memory_pressure"`` — stable machine-readable identifier.
+        name (str): ``"Memory Pressure"`` — display name in the report.
+        category (str): ``"memory"`` — report section.
+        category_icon (str): ``"🧠"`` — emoji for the section header.
+        scan_description (str): Shown during the scan narration.
+        finding_explanation (str): Explains the green/yellow/red scale and its
+            real-world implications.
+        recommendation (str): Concrete steps to reduce memory pressure.
+        fix_level (str): ``"instructions"`` — remediation requires quitting
+            apps; no automation is possible without user decision-making.
+        fix_description (str): Brief summary of manual remediation steps.
+        fix_steps (list[str]): Ordered Activity Monitor instructions.
+        fix_reversible (bool): ``True`` — quitting apps is reversible.
+        fix_time_estimate (str): ``"~2 minutes"`` to review and quit apps.
+    """
 
     id = "memory_pressure"
     name = "Memory Pressure"
@@ -52,7 +120,44 @@ class MemoryPressureCheck(BaseCheck):
     fix_time_estimate = "~2 minutes"
 
     def run(self) -> CheckResult:
-        """Run `memory_pressure` and parse the output for Normal/Warning/Critical level."""
+        """Run ``memory_pressure`` and parse output for Normal/Warning/Critical level.
+
+        The ``memory_pressure`` tool is an Apple-provided command that surfaces the
+        same underlying memory health metric used by Activity Monitor. It is located
+        at ``/usr/bin/memory_pressure`` on all supported macOS versions.
+
+        Parsing strategy:
+            1. First pass — structured line detection: scans each line for the
+               prefix ``"system memory pressure"`` and then classifies the trailing
+               word as ``"critical"``, ``"warn"``, or ``"normal"``. This matches
+               the documented format on macOS Ventura and Sonoma.
+            2. Second pass (fallback) — colour word detection: if no structured line
+               is found, searches the full output for the raw colour words
+               ``"red"``, ``"yellow"``, or ``"green"``. This catches the simplified
+               output format seen on macOS Sequoia (15+) and any future format
+               changes.
+
+        Returns:
+            CheckResult: A result with one of the following statuses:
+
+            - ``"info"`` — command failed or returned no output.
+            - ``"critical"`` — pressure is Red (system actively swapping to disk).
+            - ``"warning"`` — pressure is Yellow (RAM is running low).
+            - ``"pass"`` — pressure is Green (Normal).
+            - ``"info"`` — level could not be determined from the output.
+
+        Note:
+            The ``memory_pressure`` tool's output format is undocumented by Apple
+            and has varied across macOS major versions. The two-pass fallback
+            strategy here is intentionally defensive to handle future changes
+            without requiring a code update.
+
+        Example::
+
+            check = MemoryPressureCheck()
+            result = check.run()
+            print(result.status, result.message)
+        """
         rc, out, _ = self.shell(["memory_pressure"])
         if rc != 0 or not out:
             return self._info("Could not read memory pressure")
@@ -75,7 +180,7 @@ class MemoryPressureCheck(BaseCheck):
                     level = "normal"
                 break
 
-        # Fallback: look for colour words
+        # Fallback: look for colour words when the structured line is absent.
         if level == "unknown":
             if "red" in out_lower:
                 level = "critical"
@@ -96,7 +201,52 @@ class MemoryPressureCheck(BaseCheck):
 # ── Swap usage ────────────────────────────────────────────────────────────────
 
 class SwapUsageCheck(BaseCheck):
-    """Check virtual memory swap usage via sysctl vm.swapusage."""
+    """Check virtual memory swap usage via ``sysctl vm.swapusage``.
+
+    Virtual memory swap allows the OS to move portions of RAM contents to disk
+    when physical RAM is exhausted. On macOS, swap files are stored in
+    ``/private/var/vm/`` and are encrypted at rest. While swap enables the
+    system to continue running under memory pressure, it is significantly slower
+    than physical RAM — even on fast NVMe SSDs — and heavy swap usage adds wear
+    cycles to the SSD.
+
+    Apple Silicon vs Intel:
+        Apple Silicon's unified memory architecture (SoC-integrated DRAM) handles
+        swap somewhat more gracefully than Intel Macs because the memory bandwidth
+        is higher and the swap target is always the internal NVMe. However, the
+        fundamental performance penalty still applies, and the SSD wear concern is
+        the same.
+
+    Detection mechanism:
+        Runs ``sysctl -n vm.swapusage`` and parses the ``used = N.NN M/G`` field
+        using a regular expression. The unit (M for MiB, G for GiB) is captured
+        and used to convert the value to GiB for threshold comparison.
+
+    Severity thresholds (chosen empirically):
+        - ``pass`` — less than 1 GB swap used. Minimal, incidental usage.
+        - ``info`` — 1–3.9 GB used. Moderate; typical for power users with many
+          large apps open.
+        - ``warning`` — 4–7.9 GB used. Heavy swap; performance is meaningfully
+          degraded.
+        - ``critical`` — 8+ GB used. The system is severely swap-bound; closing
+          applications or restarting is strongly recommended.
+
+    Attributes:
+        id (str): ``"swap_usage"`` — stable machine-readable identifier.
+        name (str): ``"Swap Usage"`` — display name in the report.
+        category (str): ``"memory"`` — report section.
+        category_icon (str): ``"💽"`` — emoji for the section header.
+        scan_description (str): Shown during the scan narration.
+        finding_explanation (str): Explains why swap degrades performance and
+            wears SSDs.
+        recommendation (str): Steps to reduce swap usage.
+        fix_level (str): ``"instructions"`` — remediation is quitting apps or
+            restarting; cannot be automated.
+        fix_description (str): Brief summary of manual steps.
+        fix_reversible (bool): ``True`` — quitting apps and restarting are
+            both reversible.
+        fix_time_estimate (str): ``"~1 minute"`` to quit heavy apps.
+    """
 
     id = "swap_usage"
     name = "Swap Usage"
@@ -124,18 +274,53 @@ class SwapUsageCheck(BaseCheck):
     fix_time_estimate = "~1 minute"
 
     def run(self) -> CheckResult:
-        """Parse `sysctl vm.swapusage` for the 'used' value; threshold at 1/4/8 GB."""
+        """Parse ``sysctl -n vm.swapusage`` for the ``used`` value; threshold at 1/4/8 GB.
+
+        The ``sysctl vm.swapusage`` key returns a summary line in the format::
+
+            total = 3072.00M  used = 1536.00M  free = 1536.00M  (encrypted)
+
+        The unit suffix is either ``M`` (mebibytes) or ``G`` (gibibytes). The
+        regex captures both the numeric value and the unit character so the check
+        can normalise to GiB for threshold comparison regardless of which unit
+        macOS uses (determined by the magnitude of the swap file).
+
+        Returns:
+            CheckResult: A result with one of the following statuses:
+
+            - ``"info"`` — sysctl call failed, or output does not match the
+              expected format.
+            - ``"pass"`` — less than 1 GiB swap in use (minimal/negligible).
+            - ``"info"`` — 1–3.9 GiB used (moderate; informational).
+            - ``"warning"`` — 4–7.9 GiB used (heavy; performance degraded).
+            - ``"critical"`` — 8+ GiB used (severe; system is swap-bound).
+
+        Note:
+            The thresholds (1 GiB / 4 GiB / 8 GiB) were chosen based on typical
+            Mac configurations (8–16 GB RAM) and observed behavioural degradation
+            at each level. On Macs with 32+ GB of RAM, these thresholds remain the
+            same because swap usage at those levels still represents abnormal
+            behaviour worth flagging.
+
+        Example::
+
+            check = SwapUsageCheck()
+            result = check.run()
+            print(result.status, result.message)
+        """
         rc, out, _ = self.shell(["sysctl", "-n", "vm.swapusage"])
         if rc != 0 or not out:
             return self._info("Could not read swap usage")
 
         # Output: "total = 3072.00M  used = 1536.00M  free = 1536.00M  (encrypted)"
+        # Capture the numeric value and the M/G unit suffix.
         m = re.search(r"used\s*=\s*([\d.]+)([MG])", out)
         if not m:
             return self._info(f"Swap: {out.strip()[:60]}")
 
         value = float(m.group(1))
         unit  = m.group(2)
+        # Normalise to GiB: sysctl may report in M (mebibytes) or G (gibibytes).
         gb = value / 1024 if unit == "M" else value
         msg = f"{value:.1f} {unit}B used"
 
@@ -151,7 +336,52 @@ class SwapUsageCheck(BaseCheck):
 # ── Top CPU consumers ─────────────────────────────────────────────────────────
 
 class TopCPUCheck(BaseCheck):
-    """List the top 5 CPU-consuming processes and flag any above 90%."""
+    """List the top 5 CPU-consuming processes and flag any above 90%.
+
+    A process that consumes 90% or more of CPU continuously is almost certainly
+    misbehaving — typical user-facing apps do not sustain near-maximum CPU usage
+    for more than a few seconds. Sustained high CPU causes thermal throttling,
+    battery drain, and stolen resources from the apps the user is actually using.
+
+    Detection mechanism:
+        Runs ``ps -eo pid,pcpu,pmem,comm`` to snapshot all running processes with
+        their CPU percentage, memory percentage, and command name. The output is
+        parsed by the shared ``_parse_ps()`` helper, sorted by CPU percentage
+        descending, and the top 5 are selected. The top process's CPU usage
+        determines the result status.
+
+    ps field glossary:
+        - ``pid``:  Process ID.
+        - ``pcpu``: Instantaneous CPU usage percentage (0–100 per core).
+        - ``pmem``: Resident set size as a percentage of total physical RAM.
+        - ``comm``: Executable path (may be a full path or just the binary name).
+
+    Severity threshold:
+        - ``warning`` — the highest-CPU process is at 90% or more.
+        - ``pass``    — all processes are below 90% CPU.
+
+    Why 90%:
+        On modern multi-core Macs, a single process consuming exactly 100% of one
+        core is normal (e.g. a compilation job). However, when ``pcpu`` approaches
+        or exceeds 90% it often means the process is spinning in a tight loop due
+        to a bug or runaway state. 90% was chosen over 100% because macOS reports
+        ``pcpu`` as a rolling average that rarely reaches the theoretical maximum.
+
+    Attributes:
+        id (str): ``"top_cpu"`` — stable machine-readable identifier.
+        name (str): ``"Top CPU Consumers"`` — display name in the report.
+        category (str): ``"memory"`` — report section (grouped with perf checks).
+        category_icon (str): ``"⚡"`` — emoji for the section header.
+        scan_description (str): Shown during the scan narration.
+        finding_explanation (str): Explains why runaway CPU usage matters.
+        recommendation (str): Activity Monitor instructions for the user.
+        fix_level (str): ``"instructions"`` — the user must decide which
+            processes to quit; this cannot be automated safely.
+        fix_description (str): Brief Activity Monitor guidance.
+        fix_steps (list[str]): Step-by-step Activity Monitor instructions.
+        fix_reversible (bool): ``True`` — quitting processes is reversible.
+        fix_time_estimate (str): ``"~2 minutes"`` to review and act.
+    """
 
     id = "top_cpu"
     name = "Top CPU Consumers"
@@ -184,7 +414,36 @@ class TopCPUCheck(BaseCheck):
     fix_time_estimate = "~2 minutes"
 
     def run(self) -> CheckResult:
-        """Run `ps -eo pid,pcpu,pmem,comm`, sort by CPU%, and warn if top process >=90%."""
+        """Run ``ps -eo pid,pcpu,pmem,comm``, sort by CPU%, and warn if top process ≥90%.
+
+        Calls ``ps`` with a 10-second timeout (``ps`` should complete in
+        milliseconds; the timeout is a safety net to prevent a hung system from
+        blocking the scan indefinitely). The output is parsed by the shared
+        ``_parse_ps()`` helper, which discards malformed lines and converts
+        numeric fields to Python types.
+
+        The result message includes the top 3 processes by CPU for at-a-glance
+        visibility, formatted as ``"processname XX%  processname XX%  …"``.
+
+        Returns:
+            CheckResult: A result with one of the following statuses:
+
+            - ``"info"`` — ``ps`` failed or returned no parseable data.
+            - ``"warning"`` — the highest-CPU process is at ≥90%.
+            - ``"pass"`` — all processes are below 90% CPU.
+
+            Both the ``warning`` and ``pass`` results attach a ``data`` dict with
+            the key ``"top_processes"`` containing the top 5 process dicts
+            (``pid``, ``cpu``, ``mem``, ``comm``) for downstream consumers such
+            as the JSON report.
+
+        Example::
+
+            check = TopCPUCheck()
+            result = check.run()
+            if result.status == "warning":
+                print("Runaway process detected:", result.message)
+        """
         rc, out, _ = self.shell(
             ["ps", "-eo", "pid,pcpu,pmem,comm"],
             timeout=10,
@@ -202,6 +461,7 @@ class TopCPUCheck(BaseCheck):
         top_cpu = top[0]["cpu"]
         top_name = _short_name(top[0]["comm"])
 
+        # Build a compact summary of the top 3 processes for the result message.
         summary = "  ".join(
             f"{_short_name(p['comm'])} {p['cpu']:.0f}%" for p in top[:3]
         )
@@ -220,7 +480,42 @@ class TopCPUCheck(BaseCheck):
 # ── Top memory consumers ──────────────────────────────────────────────────────
 
 class TopMemoryCheck(BaseCheck):
-    """List the top 5 memory-consuming processes for visibility into RAM usage."""
+    """List the top 5 memory-consuming processes for visibility into RAM usage.
+
+    Unlike :class:`TopCPUCheck`, this check is purely informational — it does not
+    produce a ``warning`` or ``critical`` result regardless of the values it
+    finds. Its purpose is to give the user context for explaining high memory
+    pressure or swap usage, not to flag a specific threshold.
+
+    Detection mechanism:
+        Runs ``ps -eo pid,pcpu,pmem,comm``, parses output via ``_parse_ps()``,
+        sorts by ``pmem`` (memory percentage) descending, and reports the top 3
+        in the result message.
+
+    Why informational only:
+        Memory usage percentages from ``ps`` (``pmem``) represent the Resident Set
+        Size (RSS) as a fraction of total physical RAM and do not account for
+        compressed memory, shared pages, or the GPU allocation pool. Setting hard
+        thresholds on ``pmem`` would produce noisy false positives (e.g. a Chrome
+        renderer at 8% on a 16 GB Mac is completely normal). The meaningful
+        threshold for action is already surfaced by :class:`MemoryPressureCheck`.
+
+    Attributes:
+        id (str): ``"top_memory"`` — stable machine-readable identifier.
+        name (str): ``"Top Memory Consumers"`` — display name in the report.
+        category (str): ``"memory"`` — report section.
+        category_icon (str): ``"📊"`` — emoji for the section header.
+        scan_description (str): Shown during the scan narration.
+        finding_explanation (str): Names the typical large memory consumers
+            (Electron apps, browsers) to help the user self-diagnose.
+        recommendation (str): Concrete guidance on which apps to quit.
+        fix_level (str): ``"instructions"`` — quitting apps requires user
+            decision; cannot be automated.
+        fix_description (str): Brief Activity Monitor guidance.
+        fix_steps (list[str]): Step-by-step Activity Monitor instructions.
+        fix_reversible (bool): ``True`` — quitting apps is reversible.
+        fix_time_estimate (str): ``"~2 minutes"`` to review and act.
+    """
 
     id = "top_memory"
     name = "Top Memory Consumers"
@@ -253,7 +548,30 @@ class TopMemoryCheck(BaseCheck):
     fix_time_estimate = "~2 minutes"
 
     def run(self) -> CheckResult:
-        """Run `ps -eo pid,pcpu,pmem,comm`, sort by memory%, and report the top 3."""
+        """Run ``ps -eo pid,pcpu,pmem,comm``, sort by memory%, and report the top 3.
+
+        Calls ``ps`` with a 10-second timeout as a safety net. The output is
+        parsed by the shared ``_parse_ps()`` helper. Processes are sorted by
+        ``mem`` (pmem percentage) descending, and a compact summary string of
+        the top 3 is included in the result message.
+
+        Returns:
+            CheckResult: A result with one of the following statuses:
+
+            - ``"info"`` — ``ps`` failed or returned no parseable data.
+            - ``"info"`` — always; this check is informational by design
+              (no ``warning`` or ``critical`` conditions are defined).
+
+            The result attaches a ``data`` dict with key ``"top_processes"``
+            containing the top 5 process dicts (``pid``, ``cpu``, ``mem``,
+            ``comm``) for downstream consumers such as the JSON report.
+
+        Example::
+
+            check = TopMemoryCheck()
+            result = check.run()
+            print(result.message)  # e.g. "Top memory consumers: Safari 8.1%  Slack 5.3%  ..."
+        """
         rc, out, _ = self.shell(
             ["ps", "-eo", "pid,pcpu,pmem,comm"],
             timeout=10,
@@ -268,6 +586,7 @@ class TopMemoryCheck(BaseCheck):
         if not top:
             return self._info("No process data available")
 
+        # Report the top 3 by memory % for a concise but informative message.
         summary = "  ".join(
             f"{_short_name(p['comm'])} {p['mem']:.1f}%" for p in top[:3]
         )
@@ -281,7 +600,44 @@ class TopMemoryCheck(BaseCheck):
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _parse_ps(output: str) -> list[dict]:
-    """Parse `ps -eo pid,pcpu,pmem,comm` output into list of dicts."""
+    """Parse ``ps -eo pid,pcpu,pmem,comm`` output into a list of process dicts.
+
+    The ``ps`` output begins with a header line (``PID %CPU %MEM COMM``) that
+    is unconditionally skipped by slicing ``output.splitlines()[1:]``. Each
+    remaining line is split on whitespace with a maximum of 3 splits
+    (``split(None, 3)``) to correctly handle command names that contain spaces
+    (e.g. ``"Google Chrome Helper (Renderer)"``). Lines with fewer than 4 fields
+    are silently skipped.
+
+    Args:
+        output (str): Raw standard output from the command
+            ``ps -eo pid,pcpu,pmem,comm``.
+
+    Returns:
+        list[dict]: A list of process dictionaries. Each dict has the following
+        keys:
+
+        - ``"pid"`` (int): Process ID.
+        - ``"cpu"`` (float): CPU usage as a percentage (0.0–100.0 per core).
+        - ``"mem"`` (float): Resident set size as a percentage of total RAM.
+        - ``"comm"`` (str): Full command path as reported by ``ps``
+          (may be absolute path or relative name depending on the process).
+
+        Lines that fail integer/float conversion (malformed ps output) are
+        silently skipped.
+
+    Note:
+        ``pcpu`` in ``ps`` is not a real-time reading; it is a rolling exponential
+        moving average of CPU utilisation since the process started. For long-lived
+        processes (hours or days), this may understate a *recent* spike in CPU
+        usage.
+
+    Example::
+
+        raw = "  PID  %CPU %MEM COMMAND\\n  123  45.2  3.1 /usr/bin/python3\\n"
+        procs = _parse_ps(raw)
+        # procs == [{"pid": 123, "cpu": 45.2, "mem": 3.1, "comm": "/usr/bin/python3"}]
+    """
     procs = []
     for line in output.splitlines()[1:]:  # skip header
         parts = line.split(None, 3)
@@ -295,17 +651,45 @@ def _parse_ps(output: str) -> list[dict]:
                 "comm": parts[3].strip(),
             })
         except ValueError:
+            # Malformed line (e.g. non-numeric PID in process table race condition);
+            # skip it to keep the parse result clean.
             continue
     return procs
 
 
 def _short_name(comm: str) -> str:
-    """Shorten a process command path to just the filename."""
+    """Shorten a process command path to just the basename, truncated to 24 characters.
+
+    ``ps``'s ``comm`` field may contain an absolute path such as
+    ``/Applications/Foo.app/Contents/MacOS/Foo`` or just the binary name.
+    For display in the compact result message, only the final path component
+    is needed. The result is truncated to 24 characters to keep lines
+    a fixed width and avoid wrapping in the terminal report.
+
+    Args:
+        comm (str): The raw command value from ``ps -eo comm``. May be an
+            absolute path, a relative path, or a bare binary name.
+
+    Returns:
+        str: The basename of the command path, truncated to 24 characters.
+        If the input contains no ``"/"`` character, the input itself is
+        returned (truncated to 24 characters).
+
+    Example::
+
+        _short_name("/Applications/Safari.app/Contents/MacOS/Safari")
+        # Returns: "Safari"
+
+        _short_name("com.apple.WebKit.WebContent")
+        # Returns: "com.apple.WebKit.WebCon"  (24 chars)
+    """
     return comm.rsplit("/", 1)[-1][:24]
 
 
 # ── Export ────────────────────────────────────────────────────────────────────
 
+#: Ordered list of memory and performance check classes exported to the scan
+#: orchestrator. Order determines display order in the report's memory section.
 ALL_CHECKS = [
     MemoryPressureCheck,
     SwapUsageCheck,

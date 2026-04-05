@@ -1,17 +1,51 @@
 """
-Fix executors — one function per fix_level.
+Fix executors — one function per ``fix_level``.
 
-Each function:
-  - Receives a CheckResult and a Rich Console
-  - Performs the fix action (or prints instructions)
-  - Streams output where applicable
-  - Returns True on success, False on failure/cancel
+This module contains four executor functions, each implementing one tier of
+the fix capability framework defined in :class:`~macaudit.checks.base.CheckResult`.
+Every function shares the same contract:
 
-Fix levels:
-  auto         — shell command, output streamed live
-  auto_sudo    — shell command via osascript (native macOS password dialog)
-  guided       — open System Settings deep link, print what to look for
-  instructions — print step-by-step manual steps
+  - Accepts a :class:`~macaudit.checks.base.CheckResult` and a
+    :class:`rich.console.Console`.
+  - Performs the fix action (or prints guidance).
+  - Returns ``True`` on success or user-confirmed completion, ``False`` on
+    failure, cancellation, or timeout.
+
+Fix level registry:
+
+    ``auto``
+        Run ``result.fix_command`` as a subprocess.  Output is streamed line
+        by line to the console so the user can see progress in real time.
+        Shell injection is prevented by always using ``shell=False``; the
+        command is an arg list hardcoded in the check definition.
+
+    ``auto_sudo``
+        Run ``result.fix_command`` with administrator privileges via
+        ``osascript do shell script "…" with administrator privileges``.
+        This approach presents the native macOS authentication dialog rather
+        than a bare ``sudo`` prompt, which is the Apple-recommended pattern
+        for GUI-adjacent tools needing privilege escalation.
+
+    ``guided``
+        Open the relevant System Settings pane via a deep-link URL stored in
+        ``result.fix_url``.  Print the recommendation text and any
+        ``fix_steps`` so the user knows exactly what to click.  Falls back to
+        opening the top-level System Settings app if the deep link fails
+        (deep links for specific panes were introduced in macOS Ventura 13).
+
+    ``instructions``
+        Print numbered manual steps from ``result.fix_steps``.  No commands
+        are executed.  This level is used for fixes that require Recovery Mode,
+        hardware actions, or sensitive multi-step procedures.
+
+Security note:
+    All ``fix_command`` lists are **static, hardcoded** in the check class
+    definitions.  They are never constructed from user-supplied data.
+    ``shell=False`` is always used in ``subprocess`` calls to prevent shell
+    injection.
+
+Attributes:
+    None — this module exports only the four executor functions.
 """
 
 from __future__ import annotations

@@ -1,19 +1,51 @@
 """
-Shell secrets check — opt-in via --check-shell-secrets.
+Shell secrets scanner — opt-in check enabled via ``--check-shell-secrets``.
 
-Scans shell configuration files for patterns that look like hardcoded
-credentials: API keys, passwords, tokens, AWS credentials, etc.
+This module implements a single check that scans shell configuration files
+(``~/.zshrc``, ``~/.bashrc``, etc.) for patterns matching hardcoded
+credentials such as API keys, tokens, and passwords.
 
-This check is intentionally opt-in because it reads the full content of
-shell config files. Values are always truncated before display — the full
-secret is never shown.
+Opt-in design rationale:
+    This check reads the full contents of shell config files, which may contain
+    personal information beyond credentials (aliases, functions, private PATH
+    entries).  Because users must explicitly pass ``--check-shell-secrets`` to
+    run it, they provide informed consent before their config is scanned.  The
+    scan results are not written to history (never persisted to disk) and the
+    ``--json`` output warns on stderr when used together with
+    ``--check-shell-secrets``.
 
-Design:
-  - Match by KEY name pattern (case-insensitive)
-  - Require value to look like a real secret (not a variable reference,
-    file path, or common non-secret string)
-  - One finding per line (stop at first match)
-  - Truncate displayed value to first 4 + last 2 chars
+Detection methodology:
+    1. **Key-name matching** — the ``_CRED_RE`` regex matches lines containing
+       an assignment (``KEY=value``, ``KEY: value``, ``export KEY=value``) where
+       the left-hand side matches either a specific known credential name
+       (``AWS_SECRET_ACCESS_KEY``, ``GITHUB_TOKEN``, etc.) or a generic
+       pattern ending in ``_API_KEY``, ``_SECRET``, ``_TOKEN``, etc.
+    2. **Value length filter** — the value must be at least 10 characters long.
+       This eliminates placeholder strings like ``"none"`` or ``"changeme"``.
+    3. **Safe-value allow-list** — ``_SAFE_VALUE_RE`` matches values that look
+       like variable references (``$VAR``), file paths (``/``, ``~``), URLs
+       (``https://``), short lowercase words, pure numbers, or booleans.
+       Matches here are unconditionally skipped (false-positive suppression).
+
+Secret redaction:
+    Matching values are never displayed in full.  The displayed form is
+    ``<first 4 chars>…<last 2 chars>``, e.g. ``ghp_…xy``.  This is enough
+    to help the user identify which secret was found without exposing the
+    full credential.
+
+Attributes:
+    _SHELL_CONFIGS (list[str]): Paths (relative to ``~``) of shell config
+        files to scan.
+    _CRED_RE (re.Pattern): Compiled regular expression that detects credential
+        key-value assignment lines.  See inline comments for group semantics.
+    _SAFE_VALUE_RE (re.Pattern): Compiled regular expression that matches
+        known-safe value patterns used to suppress false positives.
+    ALL_CHECKS (list[type[BaseCheck]]): The single check exported to the
+        scan orchestrator.
+
+Note:
+    The ``ShellSecretsCheck`` category is ``"security"`` so that findings
+    contribute to the security section of the health score.
 """
 
 from __future__ import annotations
@@ -136,7 +168,39 @@ class ShellSecretsCheck(BaseCheck):
     fix_time_estimate = "~10 minutes"
 
     def run(self) -> CheckResult:
-        """Iterate shell config files, match _CRED_RE patterns, filter false positives, and report redacted findings."""
+        """Scan shell config files with ``_CRED_RE``; suppress false positives via ``_SAFE_VALUE_RE``; redact findings.
+
+        The check iterates ``_SHELL_CONFIGS``, reads each existing file, and
+        applies ``_CRED_RE`` to every non-comment, non-blank line.  When a match
+        is found:
+
+        1. The raw value (group 2 of the match) is tested against
+           ``_SAFE_VALUE_RE``; matches are skipped (false positive).
+        2. The value is redacted to ``<first 4>…<last 2>`` characters.
+        3. A finding dict is appended with the filename, line number, key name,
+           and redacted value.
+
+        Only the **first** match per line is recorded (early break after one
+        finding per line prevents duplicate entries for lines with multiple
+        variable assignments on the same line — an unusual but valid shell syntax).
+
+        Returns:
+            CheckResult: A result with one of the following statuses:
+
+            - ``"pass"`` — no potential credentials found in any scanned file.
+            - ``"warning"`` — one or more lines contain what appear to be
+              hardcoded credentials; redacted key names and values shown.
+
+            The result ``data`` dict includes:
+              - ``"findings"`` (list[dict]): Each dict has ``file``, ``line``,
+                ``key``, and ``redacted_value``.
+              - ``"files_scanned"`` (list[str]): Names of files that were read.
+
+        Note:
+            ``PermissionError`` and ``OSError`` when reading individual config
+            files are caught and silently skipped so a restricted file never
+            blocks the rest of the scan.
+        """
         findings: list[dict] = []
         files_scanned: list[str] = []
 

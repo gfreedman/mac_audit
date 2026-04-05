@@ -1,14 +1,57 @@
 """
-Network and sharing checks.
+Network exposure and sharing-service checks.
+
+This module implements 10 checks that audit the network-facing attack surface
+of the Mac, covering wireless discoverability, active sharing services, DNS
+configuration, proxy settings, listening ports, and Bluetooth exposure.
+
+Design decisions:
+    - All service-detection checks (SSH, Screen Sharing, File Sharing, Internet
+      Sharing) use ``launchctl list <service-name>`` as the primary probe.
+      This is more reliable than reading plist files directly because launchctl
+      reflects the *live* kernel service state, not just the stored preference.
+      Plist files are read as a fallback when launchctl is unavailable (e.g.
+      when macaudit runs in a non-standard user context).
+    - The DNS check targets only **public IPv4** addresses not in the
+      known-safe set.  Private RFC-1918 ranges (10.x, 192.168.x, 172.16–31.x)
+      and IPv6 addresses are unconditionally excluded; DHCP-assigned local
+      resolvers are nearly always benign.
+    - The Proxy check detects the default network interface via ``route get
+      default`` rather than hardcoding ``en0`` or ``en1``, which handles Macs
+      using Ethernet (en2, en3) or Thunderbolt adapters as the primary interface.
+    - The listening-ports check uses ``lsof`` rather than ``netstat`` because
+      ``lsof -i`` reports the process name alongside each port, allowing the
+      display to show "TCP:12345 (processname)" rather than a raw port number.
+    - Loopback-only listeners (127.0.0.1, ::1) are excluded from the
+      ListeningPortsCheck because they are not reachable from the network and
+      never represent an external exposure.
 
 Checks:
-  - AirDropCheck       — AirDrop discoverability (Everyone = risky on public Wi-Fi)
-  - RemoteLoginCheck   — SSH remote login enabled
-  - ScreenSharingCheck — Screen Sharing / Remote Desktop enabled
-  - FileSharingCheck   — File Sharing (SMB/AFP) enabled
-  - DNSCheck           — Custom or suspicious DNS servers
-  - ProxyCheck         — HTTP/HTTPS proxy configured
-  - SavedWifiCheck     — Number of saved Wi-Fi networks
+    - :class:`AirDropCheck`          — AirDrop discoverability setting.
+    - :class:`RemoteLoginCheck`      — SSH remote login service state.
+    - :class:`ScreenSharingCheck`    — Screen Sharing (VNC) service state.
+    - :class:`FileSharingCheck`      — SMB / AFP file sharing service state.
+    - :class:`InternetSharingCheck`  — NAT hotspot / Internet Sharing state.
+    - :class:`DNSCheck`              — Custom or suspicious DNS nameservers.
+    - :class:`ProxyCheck`            — Active HTTP / HTTPS proxy detection.
+    - :class:`SavedWifiCheck`        — Count of saved Wi-Fi networks.
+    - :class:`BluetoothCheck`        — Bluetooth power state and discoverability.
+    - :class:`ListeningPortsCheck`   — TCP and UDP listening port enumeration.
+
+Attributes:
+    _KNOWN_GOOD_DNS (set[str]): IPv4 addresses of well-known, trustworthy
+        public DNS resolvers.  Addresses in this set do not trigger the
+        DNSCheck warning even if they are not in a private range.
+    _PRIVATE_PREFIXES (tuple[str, ...]): Tuple of address prefixes that
+        identify RFC-1918 private network ranges and loopback.  Used by
+        DNSCheck to unconditionally skip private-range DNS addresses.
+    ALL_CHECKS (list[type[BaseCheck]]): Ordered list of check classes
+        exported to the scan orchestrator.
+
+Note:
+    All subprocess calls use ``self.shell()``, which enforces ``LANG=C``
+    and ``LC_ALL=C`` to guarantee English-language output for string
+    matching regardless of the user's system locale.
 """
 
 from __future__ import annotations
@@ -50,7 +93,22 @@ class AirDropCheck(BaseCheck):
     fix_time_estimate = "~30 seconds"
 
     def run(self) -> CheckResult:
-        """Read com.apple.sharingd DiscoverableMode; warn if 'Everyone', pass if 'Contacts Only' or 'Off'."""
+        """Read ``com.apple.sharingd DiscoverableMode`` and classify the discoverability setting.
+
+        Reads the ``DiscoverableMode`` key from the ``com.apple.sharingd``
+        defaults domain.  If the key is absent (``defaults read`` returns
+        non-zero), AirDrop is likely set to ``"Contacts Only"`` — the safe
+        default.
+
+        Returns:
+            CheckResult: A result with one of the following statuses:
+
+            - ``"info"`` — key absent; assumed ``"Contacts Only"`` (safe default).
+            - ``"warning"`` — mode is ``"Everyone"``; any nearby device can see
+              the Mac.
+            - ``"pass"`` — mode is ``"Contacts Only"`` or ``"Off"``.
+            - ``"info"`` — any other unrecognised mode value.
+        """
         rc, out, _ = self.shell(
             ["defaults", "read", "com.apple.sharingd", "DiscoverableMode"]
         )
@@ -100,7 +158,20 @@ class RemoteLoginCheck(BaseCheck):
     fix_time_estimate = "~30 seconds"
 
     def run(self) -> CheckResult:
-        """Try `systemsetup -getremotelogin`; fall back to checking launchctl for sshd."""
+        """Detect SSH service state via ``systemsetup -getremotelogin`` with launchctl fallback.
+
+        ``systemsetup -getremotelogin`` is the canonical query but requires the
+        user to be in the ``admin`` group.  When it returns a non-zero exit code
+        (permission denied or unavailable), the check falls back to querying
+        ``launchctl list com.openssh.sshd``: a zero exit code means the SSH
+        daemon is registered and running.
+
+        Returns:
+            CheckResult: A result with one of the following statuses:
+
+            - ``"warning"`` — remote login is on; SSH access is open.
+            - ``"pass"`` — remote login is off (SSH daemon not running).
+        """
         rc, out, _ = self.shell(["systemsetup", "-getremotelogin"])
         if rc != 0:
             # systemsetup may require sudo — try launchctl
@@ -149,7 +220,19 @@ class ScreenSharingCheck(BaseCheck):
     fix_time_estimate = "~30 seconds"
 
     def run(self) -> CheckResult:
-        """Check launchctl for com.apple.screensharing; also probe `sharing -l` as fallback."""
+        """Detect Screen Sharing service via ``launchctl`` with ``sharing -l`` as fallback.
+
+        Queries ``launchctl list com.apple.screensharing``: a zero exit code
+        indicates the VNC daemon is registered and running.  If launchctl
+        returns an error, the check falls back to ``sharing -l`` and scans
+        output for the word ``"screen"``.
+
+        Returns:
+            CheckResult: A result with one of the following statuses:
+
+            - ``"warning"`` — Screen Sharing (VNC) is enabled.
+            - ``"pass"`` — Screen Sharing is off.
+        """
         rc, out, _ = self.shell(
             ["launchctl", "list", "com.apple.screensharing"]
         )
@@ -195,7 +278,20 @@ class FileSharingCheck(BaseCheck):
     fix_time_estimate = "~30 seconds"
 
     def run(self) -> CheckResult:
-        """Check launchctl for com.apple.smbd (SMB) and com.apple.AppleFileServer (AFP)."""
+        """Detect active file sharing daemons via ``launchctl`` for both SMB and AFP.
+
+        Probes two launchd service labels in order:
+        1. ``com.apple.smbd`` — the SMB (Server Message Block) file sharing daemon
+           used by modern macOS.
+        2. ``com.apple.AppleFileServer`` — the legacy AFP (Apple Filing Protocol)
+           daemon, still present in some configurations.
+
+        Returns:
+            CheckResult: A result with one of the following statuses:
+
+            - ``"warning"`` — SMB or AFP file sharing is enabled.
+            - ``"pass"`` — both SMB and AFP are off.
+        """
         # Check if smbd is running
         rc, out, _ = self.shell(["launchctl", "list", "com.apple.smbd"])
         if rc == 0:
@@ -259,7 +355,26 @@ class DNSCheck(BaseCheck):
     fix_time_estimate = "~2 minutes"
 
     def run(self) -> CheckResult:
-        """Run `scutil --dns`, extract nameservers, and warn if any IPv4 address is not in the known-good list."""
+        """Parse ``scutil --dns`` for nameservers and flag unrecognised public IPv4 addresses.
+
+        Runs ``scutil --dns`` and extracts all ``nameserver[N]: <addr>`` entries
+        using a regular expression.  Each unique IPv4 address is checked against
+        the ``_PRIVATE_PREFIXES`` tuple (RFC-1918 / loopback) and the
+        ``_KNOWN_GOOD_DNS`` set.  Any address that passes neither filter is
+        classified as ``"suspicious"`` and triggers a warning.
+
+        IPv6 addresses are always skipped — DHCP assigns IPv6 DNS resolvers
+        from ISP or router infrastructure, which are benign in every normal
+        configuration.
+
+        Returns:
+            CheckResult: A result with one of the following statuses:
+
+            - ``"info"`` — ``scutil`` failed, or no nameservers were found.
+            - ``"warning"`` — one or more IPv4 addresses are not in the
+              known-good or private-range lists; user should verify them.
+            - ``"info"`` — all nameservers are either private-range or known-safe.
+        """
         rc, out, _ = self.shell(["scutil", "--dns"])
         if rc != 0 or not out:
             return self._info("Could not read DNS configuration")
@@ -325,7 +440,25 @@ class ProxyCheck(BaseCheck):
     fix_time_estimate = "~2 minutes"
 
     def run(self) -> CheckResult:
-        """Detect default interface via `route get default`, then query networksetup for web proxy settings."""
+        """Detect the default interface then query ``networksetup`` for active web proxy settings.
+
+        The check first runs ``route get default`` to identify the BSD interface
+        name (e.g. ``en0``) of the active default route, then maps it to the
+        ``networksetup`` display name (``"Wi-Fi"`` or ``"Ethernet"``).  This
+        avoids hardcoding ``en0`` which would fail on Macs using Ethernet or
+        Thunderbolt adapters as their primary connection.
+
+        ``networksetup -getwebproxy`` and ``-getsecurewebproxy`` are then called
+        for the detected interface.  Each output is scanned for ``Enabled: Yes``
+        and a non-empty ``Server:`` value.
+
+        Returns:
+            CheckResult: A result with one of the following statuses:
+
+            - ``"warning"`` — one or more HTTP or HTTPS proxies are active;
+              the proxy server address is included in the message.
+            - ``"pass"`` — no HTTP or HTTPS proxy is configured.
+        """
         # Detect active network interface
         rc, route_out, _ = self.shell(["route", "get", "default"])
         iface = "Wi-Fi"  # Default fallback
@@ -403,7 +536,30 @@ class SavedWifiCheck(BaseCheck):
     fix_time_estimate = "~5 minutes"
 
     def run(self) -> CheckResult:
-        """Discover Wi-Fi interface via networksetup, list preferred networks, and warn if count >20/30."""
+        """Enumerate saved Wi-Fi networks via ``networksetup`` and warn above the threshold.
+
+        The Wi-Fi interface name (e.g. ``en0``) is discovered dynamically via
+        ``networksetup -listallhardwareports`` rather than hardcoded, because on
+        Macs with multiple adapters the Wi-Fi interface may not always be ``en0``.
+        If discovery fails, ``en0`` and ``en1`` are tried as fallbacks.
+
+        ``networksetup -listpreferredwirelessnetworks <iface>`` is then called;
+        each non-header, non-blank line corresponds to one saved SSID.
+
+        Severity thresholds:
+            - ``info``    — 0–20 networks (normal).
+            - ``warning`` — 21–30 networks (somewhat high; worth reviewing).
+            - ``warning`` — 31+ networks (high; meaningful auto-join risk).
+
+        Returns:
+            CheckResult: A result with one of the following statuses:
+
+            - ``"info"`` — could not enumerate Wi-Fi networks.
+            - ``"info"`` — 0 networks saved.
+            - ``"info"`` — 1–20 networks (normal range).
+            - ``"warning"`` — 21–30 networks.
+            - ``"warning"`` — 31+ networks; auto-join attack risk highlighted.
+        """
         # Find the actual Wi-Fi interface name rather than assuming en0/en1.
         # 'networksetup -listallhardwareports' reliably maps human names to BSDs.
         wifi_iface: str | None = None
@@ -484,7 +640,22 @@ class BluetoothCheck(BaseCheck):
     fix_time_estimate = "~30 seconds"
 
     def run(self) -> CheckResult:
-        """Read ControllerPowerState from Bluetooth plist; if on, check SPBluetoothDataType for discoverable mode."""
+        """Check Bluetooth power state and, if on, whether Always Discoverable mode is set.
+
+        First reads ``ControllerPowerState`` from the
+        ``/Library/Preferences/com.apple.Bluetooth`` plist via ``defaults read``.
+        A value of ``0`` means Bluetooth is off.  If Bluetooth is on, the check
+        calls ``system_profiler SPBluetoothDataType`` to locate the
+        ``Discoverable:`` line and checks whether its value is ``"On"``.
+
+        Returns:
+            CheckResult: A result with one of the following statuses:
+
+            - ``"pass"`` — Bluetooth is off.
+            - ``"warning"`` — Bluetooth is on **and** Always Discoverable is set;
+              any nearby device can see the Mac's Bluetooth identity.
+            - ``"info"`` — Bluetooth is on but not in Always Discoverable mode.
+        """
         # ControllerPowerState: 1 = on, 0 = off
         rc, out, _ = self.shell(
             ["defaults", "read", "/Library/Preferences/com.apple.Bluetooth",
@@ -577,7 +748,23 @@ class ListeningPortsCheck(BaseCheck):
     }
 
     def _parse_lsof_output(self, out: str) -> dict[int, list[str]]:
-        """Extract (port → [commands]) from lsof output, excluding loopback and high ports."""
+        """Parse ``lsof -i`` output into a mapping of port number to process names.
+
+        Skips loopback-only listeners (127.0.0.1 and ::1) because they are not
+        reachable from the network and therefore represent no external exposure.
+        Also skips ephemeral ports (≥ 49152) which are dynamically allocated for
+        outbound connections and are not persistent listeners.
+
+        Args:
+            out (str): Raw standard output from an ``lsof -i TCP/UDP`` command.
+                The first line is the column header and is always skipped.
+
+        Returns:
+            dict[int, list[str]]: Mapping of port number (int) to list of unique
+            process names (str) that are bound to that port.  A port may have
+            multiple processes if multiple services share a well-known port via
+            SO_REUSEPORT.
+        """
         listeners: dict[int, list[str]] = {}
         for line in out.splitlines()[1:]:  # skip header
             parts = line.split()
@@ -608,7 +795,30 @@ class ListeningPortsCheck(BaseCheck):
         return listeners
 
     def run(self) -> CheckResult:
-        """Run lsof for TCP LISTEN and UDP sockets; compare ports against expected system set."""
+        """Enumerate TCP/UDP listeners via ``lsof`` and flag ports outside the expected system set.
+
+        Runs two ``lsof`` invocations concurrently (sequentially due to
+        Python's subprocess model):
+
+        1. ``lsof -i TCP -sTCP:LISTEN -n -P`` — TCP sockets in LISTEN state.
+           The ``-n`` flag suppresses DNS lookups; ``-P`` suppresses port-name
+           resolution, so ports appear as numbers.
+        2. ``lsof -i UDP -n -P`` — UDP sockets (UDP has no LISTEN state concept;
+           any bound UDP socket can receive data).
+
+        Both outputs are parsed by ``_parse_lsof_output()``.  Loopback-only
+        listeners and ephemeral ports (≥ 49152) are excluded.  The remaining
+        ports are compared against ``_EXPECTED_TCP_PORTS`` and
+        ``_EXPECTED_UDP_PORTS``; any port outside those sets is reported.
+
+        Returns:
+            CheckResult: A result with one of the following statuses:
+
+            - ``"info"`` — both ``lsof`` calls failed (unusual; e.g. no lsof).
+            - ``"pass"`` — all listening ports are in the expected system sets.
+            - ``"warning"`` — more than 5 unexpected ports are open.
+            - ``"info"`` — 1–5 unexpected ports are open (informational).
+        """
         # TCP listeners
         rc_tcp, out_tcp, _ = self.shell(
             ["lsof", "-i", "TCP", "-sTCP:LISTEN", "-n", "-P"], timeout=12
@@ -689,7 +899,25 @@ class InternetSharingCheck(BaseCheck):
     fix_time_estimate = "~30 seconds"
 
     def run(self) -> CheckResult:
-        """Read com.apple.nat plist for 'Enabled = 1'; also check kextstat for the NAT kernel extension."""
+        """Check the ``com.apple.nat`` plist for ``Enabled = 1`` with a ``kextstat`` fallback.
+
+        The primary signal is the ``NAT`` dictionary in the system configuration
+        plist at
+        ``/Library/Preferences/SystemConfiguration/com.apple.nat``.
+        An ``Enabled = 1`` entry in that dictionary confirms Internet Sharing is
+        on.  As a secondary, weaker signal, ``kextstat`` is queried for
+        ``com.apple.nke.ppp``; its presence suggests the NAT kernel module is
+        loaded, though it can persist transiently after Internet Sharing is
+        disabled.
+
+        Returns:
+            CheckResult: A result with one of the following statuses:
+
+            - ``"warning"`` — Internet Sharing is enabled (``Enabled = 1`` in plist).
+            - ``"info"`` — the NAT kernel module is loaded but the plist does
+              not confirm it is actively enabled (intermediate / partial state).
+            - ``"pass"`` — Internet Sharing is off.
+        """
         # Internet Sharing is controlled via the NAT plist
         rc, out, _ = self.shell(
             [

@@ -1,7 +1,41 @@
 """
-Mac Audit — entry point and orchestrator.
+Mac Audit — CLI entry point and scan orchestrator.
 
-CLI flags, scan loop, result collection, report dispatch.
+This module is the top-level command dispatcher for the ``macaudit`` tool.
+It owns:
+
+  - CLI definition (Click decorators, option parsing, help text).
+  - Profile resolution and category filtering.
+  - Check collection, config-based suppression, and the pre-scan prompt.
+  - Parallel check execution via ``ThreadPoolExecutor``.
+  - Scan history load/save and inter-scan diff computation.
+  - Output dispatch: narrated report, quiet mode, or JSON.
+  - Fix-mode entry.
+  - Exit-code contract for CI integration (``--fail-on-critical``).
+
+Architecture notes:
+    - All heavy imports (``macaudit.checks.*``, ``macaudit.ui.*``,
+      ``macaudit.fixer.*``) are deferred to the *inside* of functions to
+      minimise startup latency.  Only the absolute minimum needed to parse
+      CLI arguments is imported at module level.
+    - ``console`` is a module-level ``rich.Console`` instance shared by all
+      output functions.  Passing it explicitly avoids global state in the
+      UI layer.
+    - The MDM enrollment flag file (``_MDM_FLAG``) is touched on first
+      detection so the advisory is shown exactly once per install.
+
+Exit codes:
+    - ``0`` — normal exit (scan completed, no criticals, or ``--fail-on-critical``
+      not set).
+    - ``1`` — bad arguments (e.g. ``--dry-run`` without ``--fix``).
+    - ``2`` — ``--fail-on-critical`` flag is set and at least one critical
+      finding was returned.
+
+Attributes:
+    console (rich.Console): Shared Rich console instance using
+        ``MACTUNER_THEME``.  All output goes through this instance.
+    _MDM_FLAG (pathlib.Path): Sentinel file path whose existence indicates
+        the MDM advisory has already been shown to this user.
 """
 
 import shutil
@@ -280,7 +314,23 @@ def cli(
 # ── Mode resolution ───────────────────────────────────────────────────────────
 
 def _resolve_mode(fix: bool, only: Optional[str], skip: Optional[str]) -> str:
-    """Return the active mode string ('fix', 'targeted', or 'scan') based on CLI flags."""
+    """Determine the display mode label based on which CLI flags are active.
+
+    The mode label is shown in the report header and in the mode badge on
+    the summary panel so users can confirm which run type produced the report.
+
+    Args:
+        fix (bool): Whether ``--fix`` was passed.
+        only (Optional[str]): The ``--only`` category filter string, or ``None``.
+        skip (Optional[str]): The ``--skip`` category filter string, or ``None``.
+
+    Returns:
+        str: One of:
+            - ``"fix"``      — fix mode is active.
+            - ``"targeted"`` — a category filter is active (``--only`` or
+              ``--skip``).
+            - ``"scan"``     — full default scan with no filters.
+    """
     if fix:
         return "fix"
     if only or skip:
@@ -331,7 +381,22 @@ def _print_completion_help(console: Console) -> None:
 # ── MDM enrollment advisory ───────────────────────────────────────────────────
 
 def _is_mdm_enrolled() -> bool:
-    """Return True if this Mac is MDM-enrolled (profiles enrollment check)."""
+    """Detect whether this Mac is MDM-enrolled via the ``profiles`` command.
+
+    Runs ``profiles status -type enrollment`` and inspects the combined stdout
+    and stderr for enrollment indicators.  Two known strings are checked:
+    ``"enrolled via dep"`` (Device Enrolment Programme) and
+    ``"mdm enrollment: yes"`` (manual MDM enrolment).
+
+    Returns:
+        bool: ``True`` if the Mac appears to be MDM-enrolled, ``False``
+        otherwise.  Returns ``False`` on any exception (including
+        ``FileNotFoundError`` if ``profiles`` is unavailable).
+
+    Note:
+        The ``profiles`` binary requires no special permissions for the
+        ``status`` subcommand.  It is available on all supported macOS versions.
+    """
     import subprocess
     try:
         r = subprocess.run(
@@ -381,12 +446,29 @@ def _warn_if_mdm_enrolled(console: Console) -> None:
 # ── Profile resolution ────────────────────────────────────────────────────────
 
 def _resolve_profile(requested: Optional[str]) -> str:
-    """
-    Auto-detect profile if not specified.
+    """Resolve the active check profile, auto-detecting when not explicitly specified.
 
-    developer  — Homebrew is installed
-    standard   — no Homebrew / MacPorts
-    creative   — force with --profile creative
+    Profile semantics:
+        - ``"developer"`` — Homebrew is installed; activates Homebrew checks,
+          dev environment checks, and all standard checks.
+        - ``"standard"``  — no Homebrew detected; dev environment checks are
+          excluded.
+        - ``"creative"``  — must be forced via ``--profile creative``; intended
+          for creative professionals who use the standard check suite without
+          developer-specific checks.
+
+    Args:
+        requested (Optional[str]): The value passed to ``--profile``, or
+            ``None`` for auto-detection.
+
+    Returns:
+        str: The resolved profile name (lowercase): ``"developer"``,
+        ``"standard"``, or ``"creative"``.
+
+    Note:
+        ``"creative"`` cannot currently be auto-detected; it is always an
+        explicit override.  Future heuristics (e.g. detecting Adobe Creative
+        Cloud) could be added here.
     """
     if requested:
         return requested.lower()
@@ -404,11 +486,35 @@ def _collect_checks(
     skip_cats: set,
     check_shell_secrets: bool,
 ) -> list[BaseCheck]:
-    """
-    Return instantiated check objects to run, in display order.
+    """Collect and filter instantiated check objects to run in the current scan.
 
-    Category order matches the report sections:
-      system → security → homebrew → disk
+    All check classes from every category module are imported lazily inside
+    this function to keep startup time fast.  They are concatenated in the
+    canonical display order (matching the report section order in
+    ``macaudit.ui.report``), then filtered in three passes:
+
+    1. **Category filter** — if ``only_cats`` is set, only checks whose
+       ``category`` is in that set are retained.  If ``skip_cats`` is
+       non-empty, checks in those categories are removed.
+    2. **Profile filter** — checks whose ``profile_tags`` does not include
+       the resolved profile are removed.
+
+    The ``secrets`` module is only imported when ``check_shell_secrets`` is
+    ``True`` to avoid importing it on every scan.
+
+    Args:
+        profile (str): The resolved profile name (``"developer"``,
+            ``"standard"``, or ``"creative"``).
+        only_cats (Optional[set[str]]): If not ``None``, the set of category
+            slugs to include exclusively.
+        skip_cats (set[str]): Set of category slugs to exclude.  Empty set
+            means no exclusions.
+        check_shell_secrets (bool): Whether to append the opt-in secrets
+            check to the collection.
+
+    Returns:
+        list[BaseCheck]: Ordered, filtered list of instantiated check objects
+        ready for execution via ``execute()``.
     """
     from macaudit.checks.apps import ALL_CHECKS as APPS
     from macaudit.checks.dev_env import ALL_CHECKS as DEV_ENV
@@ -454,12 +560,30 @@ def _collect_checks(
 # ── Scan loop ─────────────────────────────────────────────────────────────────
 
 def _run_checks(checks: list, quiet: bool, as_json: bool) -> list[CheckResult]:
-    """
-    Execute every check with live narration and progress bar.
+    """Execute checks, returning results in input order with optional live narration.
 
-    In quiet/JSON mode the narrator is bypassed and checks run silently.
-    In narrated mode, checks run in parallel via ThreadPoolExecutor(max_workers=8)
-    and results are printed in input order for deterministic output.
+    **Quiet / JSON mode**: checks run serially via a simple list comprehension
+    so there is no live UI overhead.
+
+    **Narrated mode**: checks are submitted to a ``ThreadPoolExecutor`` with
+    8 workers.  Results are stored in a pre-allocated list indexed by their
+    original position so the output order is deterministic regardless of
+    completion order.  A contiguous-flush loop prints results above the live
+    progress area as soon as a leading run of consecutive indices completes.
+
+    The 8-worker limit was chosen to balance concurrency (most checks block on
+    ``subprocess`` calls) against not spawning so many processes that macOS
+    rate-limits the terminal.
+
+    Args:
+        checks (list[BaseCheck]): Ordered list of instantiated check objects.
+        quiet (bool): If ``True``, suppress the live narrator and progress bar.
+        as_json (bool): If ``True``, suppress the live narrator (same as
+            ``quiet`` for execution purposes).
+
+    Returns:
+        list[CheckResult]: Results in the same order as *checks*.  No result
+        is ``None``; ``execute()`` guarantees a result on every code path.
     """
     import concurrent.futures
 
@@ -495,7 +619,28 @@ def _run_checks(checks: list, quiet: bool, as_json: bool) -> list[CheckResult]:
 # ── JSON output ───────────────────────────────────────────────────────────────
 
 def _output_json(results: list[CheckResult], diff: Optional[dict] = None) -> None:
-    """Serialize all CheckResults plus system info and health score to JSON on stdout."""
+    """Serialise all check results, system metadata, and optional diff to JSON on stdout.
+
+    Builds the canonical ``schema_version: 1`` JSON payload and writes it to
+    stdout via ``click.echo`` (which handles newline buffering correctly).
+    Each ``CheckResult`` dataclass is converted to a plain dict via
+    ``dataclasses.asdict()``; the ``min_macos`` tuple is coerced to a list
+    because JSON has no tuple type.
+
+    The output schema is shared with the history module (``_build_payload`` in
+    ``history.py``) so that ``--json`` output and history files are structurally
+    identical.
+
+    Args:
+        results (list[CheckResult]): All results from the completed scan.
+        diff (Optional[dict]): The computed inter-scan diff from
+            ``compute_diff()``, or ``None`` when no previous scan exists or
+            the diff is empty.
+
+    Note:
+        This function writes **only** to stdout.  All error output goes through
+        the shared ``console`` (stderr-routed).
+    """
     import dataclasses
     import json
     from datetime import datetime, timezone

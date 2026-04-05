@@ -1,12 +1,61 @@
 """
-Mac Audit visual design system.
+Mac Audit visual design system — colours, styles, icons, and themes.
 
-All colors, styles, and icons as named constants.
-Import from here — never hardcode markup strings in other modules.
+This module is the **single source of truth** for all visual constants used
+across the tool.  Other modules must import from here rather than hardcoding
+hex strings or emoji literals.
 
-Color palette is selected at import time based on macOS appearance.
-Dark and light palettes are both 24-bit hex for consistent rendering
-across Terminal.app, iTerm2, Warp, Alacritty, etc.
+Design philosophy:
+    - **Never hardcode markup** in UI or check modules.  All colour strings,
+      style objects, and emoji characters are defined here as named constants.
+    - **Two complete palettes** are defined: one for dark terminal backgrounds
+      and one for light.  The active palette is chosen at import time by
+      querying macOS's appearance setting via ``defaults read``.
+    - **WCAG AA compliance**: both palettes target a minimum 4.5:1 contrast
+      ratio against their respective backgrounds.  Contrast ratios are
+      documented inline for each colour in the light palette.
+    - **Emoji width consistency**: only naturally 2-cell-wide emojis are used
+      as status icons.  Emojis with the VS16 variation selector (U+FE0F) such
+      as ⚠️ and ℹ️ cause a 1-vs-2 cell disagreement between Rich and many
+      terminal emulators, breaking column alignment in tabular output.
+
+Colour palette selection:
+    ``DARK_MODE`` is determined by ``_is_dark_mode()`` at import time.
+    The result is a module-level boolean that selects the active set of
+    ``COLOR_*`` constants via an ``if DARK_MODE:`` branch.
+
+Attributes:
+    APP_NAME (str): CLI tool name shown in headers and version strings.
+    APP_TAGLINE (str): One-line description shown in the welcome header.
+    APP_VERSION (str): Version string imported from ``macaudit.__version__``.
+    DARK_MODE (bool): ``True`` when macOS is in Dark Mode at import time.
+    COLOR_CRITICAL (str): 24-bit hex colour for critical severity text.
+    COLOR_WARNING (str): 24-bit hex colour for warning severity text.
+    COLOR_PASS (str): 24-bit hex colour for passing check text.
+    COLOR_INFO (str): 24-bit hex colour for informational text.
+    COLOR_BRAND (str): Brand accent colour used for headers and borders.
+    COLOR_DIM (str): Muted secondary text colour.
+    COLOR_COMMAND (str): Colour for displayed shell commands.
+    COLOR_TEXT (str): Primary body text colour.
+    COLOR_HEADER_BG (str): Background colour name for header panels.
+    COLOR_SCORE_HIGH (str): Score bar colour for scores ≥ 90.
+    COLOR_SCORE_MID (str): Score bar colour for scores 75–89.
+    COLOR_SCORE_LOW (str): Score bar colour for scores 55–74.
+    COLOR_SCORE_POOR (str): Score bar colour for scores < 55.
+    PROGRESS_BAR_COLOR (str): In-progress bar segment colour.
+    PROGRESS_COMPLETE_COLOR (str): Completed bar segment colour.
+    STYLE_CRITICAL (Style): Rich Style for critical text.
+    STYLE_WARNING (Style): Rich Style for warning text.
+    STYLE_PASS (Style): Rich Style for passing text.
+    STYLE_INFO (Style): Rich Style for info text.
+    STATUS_ICONS (dict[str, str]): Maps status slug → emoji icon.
+    STATUS_STYLES (dict[str, Style]): Maps status slug → Rich Style.
+    CATEGORY_ICONS (dict[str, str]): Maps category slug → emoji icon.
+    FIX_LEVEL_EMOJI (dict[str, str]): Maps fix_level → emoji.
+    FIX_LEVEL_LABELS (dict[str, str]): Maps fix_level → full label string.
+    FIX_LEVEL_LABEL_SHORT (dict[str, str]): Maps fix_level → short label.
+    MACTUNER_THEME (Theme): Rich Theme with semantic style names mapped to
+        the active palette colours.
 """
 
 import subprocess

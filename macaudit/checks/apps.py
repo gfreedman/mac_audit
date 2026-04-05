@@ -1,10 +1,35 @@
 """
-App-level checks.
+Application-level health checks.
+
+This module implements three checks that inspect application-level state:
+pending App Store updates, iCloud account health, and startup login items.
+
+Design decisions:
+    - ``AppStoreUpdatesCheck`` requires the ``mas`` CLI tool (not installed by
+      default).  The check is automatically skipped when ``mas`` is absent via
+      the ``requires_tool = "mas"`` gate in ``BaseCheck.execute()``.
+    - ``iCloudStatusCheck`` reads ``MobileMeAccounts`` preferences and probes
+      the ``~/Library/Mobile Documents`` directory rather than querying the
+      iCloud daemon directly.  The daemon interface is undocumented and subject
+      to change; the directory approach is stable and does not require entitlements.
+    - ``LoginItemsCheck`` uses ``osascript`` / System Events rather than
+      ``launchctl list``, because launchctl enumerates all launchd session
+      services (hundreds of XPC helpers and framework daemons) — far more than
+      what users see in System Settings → Login Items.  The AppleScript query
+      returns exactly the items shown in that UI.
 
 Checks:
-  - AppStoreUpdatesCheck — outdated App Store apps (requires mas CLI)
-  - iCloudStatusCheck    — iCloud account sign-in and Drive availability
-  - LoginItemsCheck      — startup items count via System Events (osascript)
+    - :class:`AppStoreUpdatesCheck` — outdated App Store apps via ``mas``.
+    - :class:`iCloudStatusCheck`    — iCloud account configured and Drive active.
+    - :class:`LoginItemsCheck`      — startup login items count; warns if > 15.
+
+Attributes:
+    ALL_CHECKS (list[type[BaseCheck]]): Ordered list of check classes exported
+        to the scan orchestrator.
+
+Note:
+    All subprocess calls use ``self.shell()``, which enforces ``LANG=C`` and
+    ``LC_ALL=C`` for consistent English output regardless of system locale.
 """
 
 from __future__ import annotations
@@ -50,7 +75,25 @@ class AppStoreUpdatesCheck(BaseCheck):
     fix_time_estimate = "~5 minutes"
 
     def run(self) -> CheckResult:
-        """Run `mas outdated` and count lines; each line is an app with a pending update."""
+        """Run ``mas outdated`` and report the count and names of pending updates.
+
+        ``mas outdated`` exits 0 regardless of whether updates exist; each
+        output line represents one app with a pending update in the format
+        ``<id> <current_version> (<new_version>) <name>``.  A 30-second timeout
+        is used because ``mas`` contacts the App Store API, which can be slow on
+        poor connections.
+
+        The result message includes the first three app names for at-a-glance
+        visibility.
+
+        Returns:
+            CheckResult: A result with one of the following statuses:
+
+            - ``"info"`` — ``mas`` returned an error; typically means App Store
+              is not reachable or ``mas`` needs re-authentication.
+            - ``"pass"`` — all App Store apps are up to date.
+            - ``"warning"`` — one or more apps have pending updates; names shown.
+        """
         rc, out, err = self.shell(["mas", "outdated"], timeout=30)
 
         # mas exits 0 whether or not there are updates
@@ -110,7 +153,25 @@ class iCloudStatusCheck(BaseCheck):
     fix_time_estimate = "~2 minutes"
 
     def run(self) -> CheckResult:
-        """Read MobileMeAccounts plist for account presence and check ~/Library/Mobile Documents for active sync."""
+        """Check iCloud account registration via ``MobileMeAccounts`` and Drive sync via directory probe.
+
+        Two signals are queried in order:
+
+        1. ``defaults read MobileMeAccounts Accounts`` — returns the iCloud
+           account list as a plist array.  A non-zero exit code or an empty
+           array means no iCloud account is configured on this Mac.
+        2. ``~/Library/Mobile Documents`` — the container directory for iCloud
+           Drive.  Its existence and the count of its subdirectories serve as a
+           proxy for whether iCloud Drive is actively syncing.
+
+        Returns:
+            CheckResult: A result with one of the following statuses:
+
+            - ``"info"`` — no iCloud account configured.
+            - ``"pass"`` — iCloud is active; Drive sync directory found.
+            - ``"info"`` — iCloud is configured but Drive directory is
+              inaccessible (permission restricted) or not yet created.
+        """
         # Check MobileMeAccounts preferences — present when iCloud account is configured
         rc, out, _ = self.shell(
             ["defaults", "read", "MobileMeAccounts", "Accounts"]
@@ -164,7 +225,30 @@ class LoginItemsCheck(BaseCheck):
     fix_time_estimate = "~5 minutes"
 
     def run(self) -> CheckResult:
-        """Query login items via osascript/System Events; warn if count exceeds 15."""
+        """Query startup login items via ``osascript`` / System Events and warn above threshold.
+
+        Invokes AppleScript via ``osascript -e`` to retrieve the name of every
+        login item registered with System Events — the same list shown in
+        System Settings → General → Login Items & Extensions.  The query uses
+        a 10-second timeout because System Events can be slow when the Automation
+        permission has not been granted.
+
+        Severity thresholds:
+            - ``pass``    — 0–8 items (normal range).
+            - ``info``    — 9–15 items (higher than average, worth knowing).
+            - ``warning`` — 16+ items; startup is likely slow and background
+              RAM consumption is high.
+
+        Returns:
+            CheckResult: A result with one of the following statuses:
+
+            - ``"info"`` — could not enumerate items (Automation permission not
+              granted or System Events unavailable).
+            - ``"pass"`` — no login items configured.
+            - ``"pass"`` — 1–8 items.
+            - ``"info"`` — 9–15 items.
+            - ``"warning"`` — 16+ items; names shown (first 5 + count).
+        """
         # Query actual Login Items via System Events — the same list shown in
         # System Settings → General → Login Items. This is far more accurate
         # than launchctl list, which over-counts by including all launchd session

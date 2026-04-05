@@ -1,16 +1,41 @@
 """
-Fix session orchestrator.
+Fix session orchestrator — interactive and automatic fix flow.
 
-Pure sequential 1:1 fix flow — each fix shown in full context,
-approve or skip inline, then run. No pre-selection menu.
+This module drives the fix-mode UX after a scan completes.  It filters fixable
+results, sorts them by severity, and presents each one as a rich card with full
+context before the user approves or skips it.
 
-Fix level behaviour:
-  auto         — show card, ask y/N, run command
-  auto_sudo    — show card, ask y/N, run command (may prompt for password)
-  guided       — show card, press ↵ to open System Settings or skip
-  instructions — show card, press ↵ to print steps or skip
+Session modes:
 
---auto mode bypasses the interactive loop and applies all safe AUTO fixes directly.
+    **Interactive mode** (default ``--fix``)
+        Each fixable result is displayed sequentially as a styled ``Panel``
+        containing the status, finding explanation, fix description, command or
+        steps, and metadata (time estimate, reversibility, sudo requirement).
+        The user chooses Apply / Skip / Quit via a ``TerminalMenu`` before
+        anything executes.
+
+    **Auto mode** (``--fix --auto``)
+        Bypasses the per-fix menu for checks whose ``fix_level == "auto"``
+        *and* ``fix_reversible == True`` *and* ``requires_sudo == False``.
+        This "safe AUTO" filter ensures no irreversible or privileged operations
+        run without explicit approval.
+
+    **Dry-run mode** (``--fix --dry-run``)
+        Walks through the entire fix flow without executing any changes.
+        Useful for previewing which fixes would be applied.
+
+Sorting contract:
+    Fixable results are sorted by severity (``critical`` → ``warning`` →
+    ``error`` → ``info``) so the most important fixes are presented first.
+
+Attributes:
+    _FIXABLE_STATUSES (frozenset[str]): Set of check statuses that qualify a
+        result for inclusion in the fix session.  ``pass`` and ``skip`` results
+        are excluded because there is nothing to fix.
+    _FIXABLE_LEVELS (frozenset[str]): Set of ``fix_level`` values that have an
+        executor.  ``"none"`` results are excluded because no action is possible.
+    _SEVERITY_ORDER (dict[str, int]): Maps status strings to sort keys for
+        the severity-descending display order.
 """
 
 from __future__ import annotations
@@ -180,7 +205,20 @@ def _run_auto_mode(
 # ── Execution helpers ─────────────────────────────────────────────────────────
 
 def _dispatch(result: CheckResult, console: Console) -> bool:
-    """Route to the correct executor."""
+    """Route a fix result to the appropriate executor function.
+
+    Looks up ``result.fix_level`` in a static dispatch map and calls the
+    corresponding executor.  Returns ``False`` if the fix level has no
+    registered executor (defensive guard; should not occur if ``_FIXABLE_LEVELS``
+    is kept in sync with the dispatch map).
+
+    Args:
+        result (CheckResult): The check result whose fix should be executed.
+        console (Console): Rich console for output streaming.
+
+    Returns:
+        bool: ``True`` if the executor reported success, ``False`` otherwise.
+    """
     dispatch_map = {
         "auto":         run_auto_fix,
         "auto_sudo":    run_auto_sudo_fix,
@@ -197,7 +235,24 @@ def _dispatch(result: CheckResult, console: Console) -> bool:
 # ── UI helpers ────────────────────────────────────────────────────────────────
 
 def _get_fixable(results: list[CheckResult]) -> list[CheckResult]:
-    """Return fixable results sorted by severity (critical first, info last)."""
+    """Filter and sort results to the subset that can be acted on in the fix session.
+
+    A result qualifies as fixable if its ``status`` is in ``_FIXABLE_STATUSES``
+    **and** its ``fix_level`` is in ``_FIXABLE_LEVELS``.  Results with
+    ``status="pass"`` or ``status="skip"`` are excluded because there is nothing
+    to act on.  Results with ``fix_level="none"`` are excluded because no
+    executor can handle them.
+
+    The filtered list is sorted by ``_SEVERITY_ORDER`` so critical findings
+    appear first, giving the most urgent fixes the highest priority.
+
+    Args:
+        results (list[CheckResult]): All results from a completed scan.
+
+    Returns:
+        list[CheckResult]: Filtered and severity-sorted list of actionable
+        results.  Empty list if no fixable results exist.
+    """
     fixable = [
         r for r in results
         if r.status in _FIXABLE_STATUSES
@@ -212,7 +267,28 @@ def _print_fix_card(
     idx: int,
     total: int,
 ) -> None:
-    """Print a rich Panel with full context for a single fix."""
+    """Render a rich ``Panel`` containing the full context for a single fix.
+
+    The card layout (top to bottom):
+      1. Status badge + fix level label.
+      2. Finding message + explanation (indented).
+      3. "What this fix does" section with the fix description.
+         For AUTO / AUTO_SUDO: the shell command is shown.
+         For INSTRUCTIONS: the numbered steps are shown.
+      4. Footer metadata: time estimate, reversibility badge, sudo indicator.
+
+    The panel border colour reflects the severity:
+      - ``"critical"`` → bright red.
+      - ``"warning"``  → yellow.
+      - ``"info"``     → cyan.
+      - Other          → dim.
+
+    Args:
+        console (Console): Rich console for rendering.
+        result (CheckResult): The check result for this fix card.
+        idx (int): 1-based index of this fix in the session (for the title).
+        total (int): Total number of fixable items in the session.
+    """
     status_icon  = STATUS_ICONS.get(result.status, "?")
     status_style = STATUS_STYLES.get(result.status)
     level_emoji  = FIX_LEVEL_EMOJI.get(result.fix_level, "·")
