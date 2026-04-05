@@ -1,9 +1,27 @@
 """
-Tests for macaudit/history.py — scan history I/O.
+Tests for macaudit/history.py — scan history persistence.
 
-Uses tmp_path + monkeypatch to redirect _HISTORY_DIR to a temp directory.
-Covers: save creates valid JSON, load from empty → None, load returns most
-recent, prune keeps _MAX_SCANS, save→load roundtrip.
+Covers:
+    - ``save_scan()``: creates a valid JSON file with the expected schema;
+      filename is ISO-8601 with hyphens (filesystem-safe, no colons).
+    - ``load_previous_scan()``: returns ``None`` for an empty or absent
+      directory; returns the most recent file (lexicographic = chronological);
+      handles corrupt JSON gracefully.
+    - ``prune_history()``: removes the oldest files when the count exceeds
+      ``_MAX_SCANS``; does nothing when at or below the limit.
+    - ``save_scan`` → ``load_previous_scan`` roundtrip: data survives
+      serialise → write → read → parse intact.
+
+Design:
+    ``_patch_history_dir`` uses ``monkeypatch.setattr`` to redirect
+    ``history_mod._HISTORY_DIR`` to a subdirectory of ``tmp_path``, so no
+    test ever touches ``~/.config/macaudit/history/``.  ``_MAX_SCANS`` is
+    also patched per-test where the default (10) would require creating too
+    many files to trigger pruning.
+
+Note:
+    The ``_result()`` helper follows the same pattern as other test modules
+    so the signature is consistent across the test suite.
 """
 
 import json
@@ -16,7 +34,19 @@ from macaudit.history import load_previous_scan, prune_history, save_scan
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 def _result(**kwargs) -> CheckResult:
-    """Build a minimal CheckResult; kwargs override any field."""
+    """Build a minimal ``CheckResult`` suitable for passing to ``save_scan()``.
+
+    All required ``CheckResult`` fields are populated with harmless defaults.
+    Pass keyword arguments to override any subset of fields for scenario-
+    specific testing.
+
+    Args:
+        **kwargs: Any ``CheckResult`` field to override.  Common overrides:
+            ``id``, ``status``, ``message``.
+
+    Returns:
+        A fully-initialised ``CheckResult`` instance.
+    """
     defaults = dict(
         id="test_check",
         name="Test Check",
@@ -35,13 +65,24 @@ def _result(**kwargs) -> CheckResult:
 
 
 def _patch_history_dir(monkeypatch, tmp_path):
-    """Point _HISTORY_DIR to a temp directory for isolated tests."""
+    """Redirect ``history_mod._HISTORY_DIR`` to an isolated temp subdirectory.
+
+    Prevents every test from reading or writing the real
+    ``~/.config/macaudit/history/`` directory.  The subdirectory is *not*
+    pre-created here; ``save_scan()`` creates it on first write, and tests
+    that need it to already exist do so explicitly.
+
+    Args:
+        monkeypatch: The pytest ``monkeypatch`` fixture.
+        tmp_path:    The pytest ``tmp_path`` fixture (unique per test).
+    """
     monkeypatch.setattr(history_mod, "_HISTORY_DIR", tmp_path / "history")
 
 
 # ── Tests ────────────────────────────────────────────────────────────────────
 
 class TestSaveScan:
+    """Tests for ``save_scan()`` — file creation and naming contract."""
     def test_save_creates_json_file(self, tmp_path, monkeypatch):
         """save_scan creates a valid JSON file in the history directory."""
         _patch_history_dir(monkeypatch, tmp_path)
@@ -66,6 +107,7 @@ class TestSaveScan:
 
 
 class TestLoadPreviousScan:
+    """Tests for ``load_previous_scan()`` — reading and selecting the most recent history file."""
     def test_load_from_empty_returns_none(self, tmp_path, monkeypatch):
         """Empty history dir → None."""
         _patch_history_dir(monkeypatch, tmp_path)
@@ -104,6 +146,7 @@ class TestLoadPreviousScan:
 
 
 class TestPruneHistory:
+    """Tests for ``prune_history()`` — enforcing the ``_MAX_SCANS`` cap."""
     def test_prune_keeps_max_scans(self, tmp_path, monkeypatch):
         """Prune removes oldest files when count exceeds _MAX_SCANS."""
         _patch_history_dir(monkeypatch, tmp_path)
@@ -137,8 +180,15 @@ class TestPruneHistory:
 
 
 class TestSaveLoadRoundtrip:
+    """End-to-end roundtrip: ``save_scan`` then ``load_previous_scan`` returns equivalent data."""
+
     def test_roundtrip(self, tmp_path, monkeypatch):
-        """save_scan → load_previous_scan returns equivalent data."""
+        """All ``CheckResult`` fields survive JSON serialisation and deserialisation.
+
+        Verifies the schema contract: the IDs present in the saved results
+        are all recoverable from the loaded payload, and the top-level
+        ``schema_version`` key is present.
+        """
         _patch_history_dir(monkeypatch, tmp_path)
         results = [
             _result(id="sip", status="pass", message="enabled"),

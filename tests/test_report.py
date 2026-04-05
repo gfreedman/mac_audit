@@ -1,9 +1,27 @@
 """
-Tests for ui/report.py.
+Tests for ui/report.py — Rich rendering of scan results and diffs.
 
 Covers:
-  - MDM inline badges:    _render_issue and _compact_table with mdm_enrolled flag
-  - Contextual verdicts:  _score_verdict with 0, 1, 2, and 3+ criticals
+    - ``_render_issue()`` MDM badge: shown when ``mdm_enrolled=True`` and the
+      check ID is in ``MDM_CHECK_IDS``; hidden otherwise.
+    - ``_compact_table()`` MDM tag: ``"managed"`` appears for MDM checks when
+      enrolled; absent for non-MDM checks or when not enrolled.
+    - ``_score_verdict()`` contextual copy: per-critical-count behaviour
+      (0, 1, 2, 3+ criticals), message normalisation (lowercase, strip period),
+      and backward-compatibility without ``critical_results``.
+    - ``build_summary_panel()`` integration: verdict text flows through to the
+      rendered panel.
+    - ``build_diff_panel()``: score delta display (positive, negative, zero),
+      improved/regressed/new/removed sections, section omission when empty,
+      previous scan timestamp.
+    - ``print_report()`` with and without a diff dict.
+
+Design:
+    All rendering tests use a ``Console`` backed by a ``StringIO`` buffer
+    (via ``_console()`` / ``_render_to_text()``) so assertions can search
+    plain text without parsing ANSI escape codes.  ``_result()`` and
+    ``TestDiffPanel._diff()`` build minimal but complete data structures
+    to keep each test focused on the property under test.
 """
 
 from io import StringIO
@@ -24,14 +42,33 @@ from macaudit.ui.report import (
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 def _console() -> tuple[Console, StringIO]:
-    """Return a Console that captures output in a StringIO buffer."""
+    """Return a Rich ``Console`` wired to a ``StringIO`` buffer.
+
+    ``highlight=False`` and ``no_color=True`` strip markup and colour codes so
+    assertions compare plain text without ANSI escape sequences.
+
+    Returns:
+        A ``(Console, StringIO)`` tuple — pass the console to the function
+        under test and read ``buf.getvalue()`` for assertions.
+    """
     buf = StringIO()
     con = Console(file=buf, highlight=False, no_color=True)
     return con, buf
 
 
 def _result(**kwargs) -> CheckResult:
-    """Build a minimal CheckResult; kwargs override any field."""
+    """Build a minimal ``CheckResult`` with sensible defaults.
+
+    All required ``CheckResult`` fields are populated.  Pass keyword arguments
+    to override any subset of fields needed for a specific test scenario.
+
+    Args:
+        **kwargs: Any ``CheckResult`` field to override.  Common overrides:
+            ``id``, ``name``, ``status``, ``message``.
+
+    Returns:
+        A fully-initialised ``CheckResult`` instance.
+    """
     defaults = dict(
         id="test_check",
         name="Test Check",
@@ -50,7 +87,16 @@ def _result(**kwargs) -> CheckResult:
 
 
 def _render_to_text(renderables: list) -> str:
-    """Render a list of Rich renderables to plain text."""
+    """Render a list of Rich renderable objects to a plain-text string.
+
+    Args:
+        renderables: Any sequence of Rich-renderable objects (``Panel``,
+            ``Text``, ``Table``, plain strings, etc.).
+
+    Returns:
+        The combined plain-text output of all rendered objects, suitable
+        for substring assertions.
+    """
     con, buf = _console()
     for r in renderables:
         con.print(r)
@@ -60,6 +106,7 @@ def _render_to_text(renderables: list) -> str:
 # ── MDM inline badges: _render_issue ─────────────────────────────────────────
 
 class TestRenderIssueMDM:
+    """MDM badge visibility in ``_render_issue()`` based on enrollment and check ID."""
     def test_mdm_badge_shown_for_mdm_check(self):
         """MDM-relevant check shows badge when mdm_enrolled=True."""
         r = _result(id="filevault", name="FileVault", status="critical",
@@ -99,6 +146,7 @@ class TestRenderIssueMDM:
 # ── MDM inline badges: _compact_table ────────────────────────────────────────
 
 class TestCompactTableMDM:
+    """MDM ``"managed"`` tag visibility in ``_compact_table()``."""
     def test_mdm_managed_tag_shown_for_mdm_check(self):
         """Compact table appends 'managed' tag for MDM checks when enrolled."""
         r = _result(id="firewall", name="Firewall", status="pass",
@@ -130,6 +178,7 @@ class TestCompactTableMDM:
 # ── Contextual verdicts: _score_verdict ──────────────────────────────────────
 
 class TestScoreVerdict:
+    """Contextual verdict copy from ``_score_verdict()`` across all critical-count branches."""
     def test_one_critical_names_the_finding(self):
         """With 1 critical, verdict names the specific finding."""
         r = _result(id="filevault", name="FileVault Disk Encryption",
@@ -196,6 +245,7 @@ class TestScoreVerdict:
 # ── Contextual verdicts: build_summary_panel integration ─────────────────────
 
 class TestSummaryPanelVerdict:
+    """Integration test: contextual verdict flows from ``_score_verdict`` into ``build_summary_panel``."""
     def test_summary_panel_includes_critical_name(self):
         """build_summary_panel verdict names the critical finding."""
         r_crit = _result(id="firewall", name="Firewall", status="critical",
@@ -213,8 +263,22 @@ class TestSummaryPanelVerdict:
 # ── Diff panel: build_diff_panel ─────────────────────────────────────────────
 
 class TestDiffPanel:
+    """Tests for ``build_diff_panel()`` and ``print_report()`` diff integration."""
+
     def _diff(self, **overrides) -> dict:
-        """Build a minimal diff dict; overrides replace defaults."""
+        """Build a minimal diff dict compatible with ``build_diff_panel()``.
+
+        All required keys are populated with sensible defaults.  Pass keyword
+        arguments to override specific fields for individual test scenarios.
+
+        Args:
+            **overrides: Any top-level key in the diff dict to override.
+                Common overrides: ``score_delta``, ``score_before``,
+                ``score_after``, ``improved``, ``regressed``.
+
+        Returns:
+            A dict with all keys consumed by ``build_diff_panel()``.
+        """
         base = {
             "previous_scan_time": "2026-02-25T18:30:00+00:00",
             "score_before": 72,
