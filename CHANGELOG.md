@@ -2,6 +2,17 @@
 
 All notable changes to Mac Audit are documented here.
 
+## [1.12.2] — 2026-09-26
+
+### Fixed
+- **Memory Pressure** no longer reports a false RED/critical on macOS 27. The tool's output no longer includes a pressure level, and the fallback matched "red" inside "wired" (`Pages wired down`). The level is now read directly from the kernel (`kern.memorystatus_vm_pressure_level`), the same value Activity Monitor shows
+- **Python PATH Conflicts** counts distinct interpreters: symlinks to the same Python (e.g. python.org's `/usr/local/bin/python3`) count once, and macOS's own `/usr/bin/python3`, which cannot be removed, is no longer flagged
+
+### Changed
+- The Homebrew formula is now generated with its explanatory comments, so they survive every release
+
+---
+
 ## [1.12.1] — 2026-09-26
 
 ### Fixed
