@@ -325,6 +325,23 @@ class TestShellHelper:
         assert rc == -1
         assert "timed out" in err.lower()
 
+    def test_extra_env_is_passed_to_subprocess(self):
+        """``env=`` entries reach the child process (used for ``HOMEBREW_NO_COLOR``)."""
+        check = _AlwaysPass()
+        rc, out, _ = check.shell(["/usr/bin/printenv", "MACAUDIT_TEST_VAR"], env={"MACAUDIT_TEST_VAR": "yes"})
+        assert rc == 0
+        assert out.strip() == "yes"
+
+    def test_extra_env_cannot_override_locale(self):
+        """The C-locale guarantee wins over caller-supplied ``LC_ALL``.
+
+        String matching across every check depends on English output, so no
+        caller may accidentally re-localise a command.
+        """
+        check = _AlwaysPass()
+        _, out, _ = check.shell(["/usr/bin/printenv", "LC_ALL"], env={"LC_ALL": "fr_FR.UTF-8"})
+        assert out.strip() == "C"
+
     def test_stderr_captured_on_nonzero_exit(self):
         """A non-zero exit code is returned unmodified (not mapped to -1).
 

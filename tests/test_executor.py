@@ -198,6 +198,18 @@ class TestRunInstructionsFix:
         assert run_instructions_fix(_result(fix_steps=None, recommendation=""), con) is False
 
 
+    def test_markup_in_steps_is_printed_literally(self):
+        """Square brackets in a step are shown verbatim, not parsed as Rich markup.
+
+        Steps can embed text lifted from tool output (e.g. a ``brew doctor``
+        warning title). Unescaped, ``[/opt]`` raises ``MarkupError`` and
+        ``[bold red]`` would restyle the fix UI.
+        """
+        con, buf = _console()
+        assert run_instructions_fix(_result(fix_steps=["see [/opt] and [bold]x[/bold]"]), con) is True
+        assert "see [/opt] and [bold]x[/bold]" in buf.getvalue()
+
+
 # ── run_guided_fix ────────────────────────────────────────────────────────────
 
 class TestRunGuidedFix:
