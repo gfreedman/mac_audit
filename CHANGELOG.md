@@ -2,6 +2,15 @@
 
 All notable changes to Mac Audit are documented here.
 
+## [1.12.1] — 2026-09-26
+
+### Fixed
+- **Homebrew health check** no longer offers `brew doctor` as an "automatic" fix — it only diagnoses, so `macaudit --fix --auto` reported success while every issue remained. The check is now step-by-step, and warnings are parsed: untrusted taps get the exact `brew untap --force` / `brew trust` commands, and other warnings are named individually
+- **Homebrew health check** reports a `brew doctor` timeout as an error rather than a Homebrew issue, and no longer passes when a failing run happens to contain the text "ready to brew"
+- **Fix steps** containing square brackets are now displayed literally instead of being interpreted as terminal formatting (which could abort the fix session)
+
+---
+
 ## [1.12.0] — 2026-02-27
 
 ### Added
