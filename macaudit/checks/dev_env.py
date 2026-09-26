@@ -123,6 +123,11 @@ class XcodeToolsCheck(BaseCheck):
 
 # ── Python PATH conflicts ─────────────────────────────────────────────────────
 
+# The python3 shipped with macOS (Command Line Tools shim). SIP-protected and
+# not removable, so it is never counted as a conflicting installation.
+_SYSTEM_PYTHON = "/usr/bin/python3"
+
+
 class PythonConflictsCheck(BaseCheck):
     """Detect multiple python3 binaries in PATH that could cause version and pip conflicts."""
 
@@ -162,40 +167,63 @@ class PythonConflictsCheck(BaseCheck):
     fix_time_estimate = "~10 minutes"
 
     def run(self) -> CheckResult:
-        """Run ``which -a python3`` and warn if more than one unique binary path is returned.
+        """Run ``which -a python3`` and warn if more than one distinct interpreter is found.
 
         ``which -a`` lists **all** matching executables in ``PATH`` in order.
-        Duplicate paths are de-duplicated via a dict (preserving order).
-        If the de-duplicated list has more than one entry it means different
-        directories in ``PATH`` each contain a different ``python3`` binary —
-        the classic conflict scenario.
+        Two entries are counted as distinct interpreters only if they resolve
+        to different files:
+
+        1. **Symlinks are resolved** (``os.path.realpath``). Installers
+           routinely symlink one interpreter into several directories — e.g.
+           the python.org installer links ``/usr/local/bin/python3`` to its
+           ``Python.framework`` binary — and that is one Python, not two.
+        2. **The OS-provided ``/usr/bin/python3`` is excluded.** It ships with
+           macOS, is protected by SIP, and cannot be removed, so counting it
+           would flag every Mac that has any other Python installed with a
+           warning the user can do nothing about. It is still listed in
+           ``data`` for transparency.
+
+        Order is preserved (first occurrence wins), so the first entry is the
+        interpreter that ``python3`` actually runs.
 
         Returns:
             CheckResult: A result with one of the following statuses:
 
             - ``"info"`` — no ``python3`` found in PATH at all.
-            - ``"pass"`` — exactly one unique ``python3`` path in PATH;
+            - ``"pass"`` — at most one distinct user-installed interpreter;
               active version string is shown.
-            - ``"warning"`` — two or more unique ``python3`` paths; the count
-              and active version are shown.
+            - ``"warning"`` — two or more distinct user-installed
+              interpreters. ``data["python_paths"]`` lists one PATH entry per
+              distinct interpreter; ``data["system_python"]`` is the excluded
+              OS path if present.
         """
         rc, out, _ = self.shell(["which", "-a", "python3"])
         if rc != 0 or not out.strip():
             return self._info("python3 not found in PATH")
 
         paths = [p.strip() for p in out.splitlines() if p.strip()]
-        unique = list(dict.fromkeys(paths))
+
+        # realpath -> first PATH entry that reached it. dict preserves
+        # insertion order, so iteration order == PATH precedence.
+        distinct: dict[str, str] = {}
+        system_python: str | None = None
+        for p in paths:
+            if p == _SYSTEM_PYTHON:
+                system_python = p
+                continue
+            distinct.setdefault(os.path.realpath(p), p)
+        unique = list(distinct.values())
 
         ver_rc, ver_out, _ = self.shell(["python3", "--version"])
         version = ver_out.strip() if ver_rc == 0 else ""
 
         if len(unique) <= 1:
-            active = unique[0] if unique else "in PATH"
+            active = unique[0] if unique else (system_python or "in PATH")
             return self._pass(f"{version}  —  {active}")
 
         return self._warning(
-            f"{len(unique)} python3 binaries in PATH — version conflicts possible",
-            data={"python_paths": unique, "active": version},
+            f"{len(unique)} python3 installations in PATH — version conflicts possible",
+            data={"python_paths": unique, "active": version, "system_python": system_python},
         )
 
 

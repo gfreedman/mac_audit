@@ -11,11 +11,14 @@ Design decisions:
       and ``TopMemoryCheck`` call ``ps`` independently rather than sharing a
       cache, because each check runs in isolation and the data changes rapidly
       enough that a stale cache would not be useful.
-    - Memory pressure is queried via the ``memory_pressure`` CLI tool rather than
-      a raw sysctl because the tool encodes Apple's own multi-factor assessment
-      (not merely the percentage of RAM in use). The output format is undocumented
-      and varies between macOS releases, so the parser uses a two-pass strategy:
-      first a structured-line pass, then a colour-word fallback.
+    - Memory pressure is read from the kernel via
+      ``sysctl -n kern.memorystatus_vm_pressure_level``. This *is* Apple's
+      multi-factor assessment (the value Activity Monitor graphs and the
+      ``memory_pressure`` tool reports), exposed as a stable integer rather than
+      undocumented prose. The ``memory_pressure`` CLI is parsed only as a
+      fallback, with whole-word matching: its output format changes between
+      releases, and substring matching once classified every macOS 27 system
+      as critical because "wi*red*" (``Pages wired down``) contains "red".
     - Swap usage is quantified via ``sysctl vm.swapusage`` rather than inspecting
       the ``/private/var/vm/swapfile*`` files directly. The sysctl gives an
       authoritative summary without requiring elevated privileges.
@@ -55,6 +58,72 @@ from macaudit.constants import (
 
 # ── Memory pressure ───────────────────────────────────────────────────────────
 
+# Kernel memory pressure levels as reported by
+# `sysctl kern.memorystatus_vm_pressure_level`. XNU converts its internal
+# level to libdispatch's DISPATCH_MEMORYPRESSURE_* bit values before
+# returning it, so the encoding is 1/2/4 rather than 0/1/2.
+_SYSCTL_PRESSURE_LEVELS: dict[str, str] = {
+    "1": "normal",    # DISPATCH_MEMORYPRESSURE_NORMAL
+    "2": "warn",      # DISPATCH_MEMORYPRESSURE_WARN
+    "4": "critical",  # DISPATCH_MEMORYPRESSURE_CRITICAL
+}
+
+# Whole-word patterns for the `memory_pressure` fallback parser. `\b` word
+# boundaries are essential: plain substring tests match "red" inside "wired"
+# and "ok" inside "broken", producing false results.
+_PRESSURE_LINE_WORDS = (
+    ("critical", re.compile(r"\bcritical\b", re.IGNORECASE)),
+    ("warn", re.compile(r"\bwarn(?:ing)?\b", re.IGNORECASE)),
+    ("normal", re.compile(r"\b(?:normal|ok)\b", re.IGNORECASE)),
+)
+_PRESSURE_COLOUR_WORDS = (
+    ("critical", re.compile(r"\bred\b", re.IGNORECASE)),
+    ("warn", re.compile(r"\byellow\b", re.IGNORECASE)),
+    ("normal", re.compile(r"\b(?:green|normal)\b", re.IGNORECASE)),
+)
+
+
+def _classify_memory_pressure_output(out: str) -> str | None:
+    """Classify ``memory_pressure`` output as ``"normal"``, ``"warn"`` or ``"critical"``.
+
+    Two passes, most specific first:
+
+    1. **Structured line** — the first line containing
+       ``"system memory pressure"`` (macOS 13–14 print
+       ``"System memory pressure level: Normal"``) is classified by the
+       first matching word in ``_PRESSURE_LINE_WORDS``.
+    2. **Colour words** — otherwise, the whole output is searched for the
+       whole words ``red`` / ``yellow`` / ``green`` (checked in that order so
+       the most severe wins).
+
+    All matching is whole-word and case-insensitive (see the note on
+    ``_PRESSURE_LINE_WORDS``). This is a pure function so it can be tested
+    against captured output from each macOS release.
+
+    Args:
+        out (str): Standard output of ``memory_pressure``.
+
+    Returns:
+        str | None: The level, or ``None`` if nothing recognisable was found
+        (macOS 27 prints neither form — only page statistics and a free
+        percentage — which is why the sysctl is the primary source).
+
+    Complexity:
+        O(n) in the length of ``out``; a constant number of regex scans.
+    """
+    for line in out.splitlines():
+        if "system memory pressure" in line.lower():
+            for level, pattern in _PRESSURE_LINE_WORDS:
+                if pattern.search(line):
+                    return level
+            break  # The structured line was present but unrecognised.
+
+    for level, pattern in _PRESSURE_COLOUR_WORDS:
+        if pattern.search(out):
+            return level
+    return None
+
+
 class MemoryPressureCheck(BaseCheck):
     """Report macOS memory pressure level (green/yellow/red) via the ``memory_pressure`` CLI.
 
@@ -70,12 +139,15 @@ class MemoryPressureCheck(BaseCheck):
       increase dramatically; the system may feel unresponsive.
 
     Detection mechanism:
-        Runs the ``memory_pressure`` command-line tool, which is provided by macOS
-        and reports the same level shown in Activity Monitor's Memory Pressure graph.
-        The output format has changed across macOS versions, so the parser uses a
-        two-pass approach: a structured ``"System memory pressure level: …"`` line
-        is checked first, then a fallback scans for raw colour words
-        (``"red"``, ``"yellow"``, ``"green"``).
+        1. **Primary** — ``sysctl -n kern.memorystatus_vm_pressure_level``. XNU
+           reports the level in libdispatch's encoding
+           (``DISPATCH_MEMORYPRESSURE_*``): ``1`` normal, ``2`` warn,
+           ``4`` critical. This is the value behind Activity Monitor's Memory
+           Pressure graph.
+        2. **Fallback** — only if the sysctl is unavailable or returns an
+           unknown value: parse the ``memory_pressure`` tool's output with
+           ``_classify_memory_pressure_output`` (see its docstring for the
+           whole-word matching rules).
 
     Attributes:
         id (str): ``"memory_pressure"`` — stable machine-readable identifier.
@@ -126,37 +198,18 @@ class MemoryPressureCheck(BaseCheck):
     fix_time_estimate = "~2 minutes"
 
     def run(self) -> CheckResult:
-        """Run ``memory_pressure`` and parse output for Normal/Warning/Critical level.
-
-        The ``memory_pressure`` tool is an Apple-provided command that surfaces the
-        same underlying memory health metric used by Activity Monitor. It is located
-        at ``/usr/bin/memory_pressure`` on all supported macOS versions.
-
-        Parsing strategy:
-            1. First pass — structured line detection: scans each line for the
-               prefix ``"system memory pressure"`` and then classifies the trailing
-               word as ``"critical"``, ``"warn"``, or ``"normal"``. This matches
-               the documented format on macOS Ventura and Sonoma.
-            2. Second pass (fallback) — colour word detection: if no structured line
-               is found, searches the full output for the raw colour words
-               ``"red"``, ``"yellow"``, or ``"green"``. This catches the simplified
-               output format seen on macOS Sequoia (15+) and any future format
-               changes.
+        """Determine the kernel's memory pressure level and grade it.
 
         Returns:
             CheckResult: A result with one of the following statuses:
 
-            - ``"info"`` — command failed or returned no output.
-            - ``"critical"`` — pressure is Red (system actively swapping to disk).
+            - ``"critical"`` — pressure is Red.
             - ``"warning"`` — pressure is Yellow (RAM is running low).
             - ``"pass"`` — pressure is Green (Normal).
-            - ``"info"`` — level could not be determined from the output.
-
-        Note:
-            The ``memory_pressure`` tool's output format is undocumented by Apple
-            and has varied across macOS major versions. The two-pass fallback
-            strategy here is intentionally defensive to handle future changes
-            without requiring a code update.
+            - ``"info"`` — neither source yielded a level (sysctl missing and
+              ``memory_pressure`` failed or printed nothing recognisable).
+            ``result.data["source"]`` records which source decided:
+            ``"sysctl"`` or ``"memory_pressure"``.
 
         Example::
 
@@ -164,44 +217,30 @@ class MemoryPressureCheck(BaseCheck):
             result = check.run()
             print(result.status, result.message)
         """
-        rc, out, _ = self.shell(["memory_pressure"])
-        if rc != 0 or not out:
-            return self._info("Could not read memory pressure")
+        level: str | None = None
+        source = "sysctl"
 
-        out_lower = out.lower()
+        rc, out, _ = self.shell(["sysctl", "-n", "kern.memorystatus_vm_pressure_level"])
+        if rc == 0:
+            level = _SYSCTL_PRESSURE_LEVELS.get(out.strip())
 
-        # memory_pressure output format is undocumented and varies by macOS release.
-        # macOS 13–14: includes a line like "System memory pressure level: Normal"
-        # macOS 15+:   may output colour words like "green"/"yellow"/"red" directly.
-        # We check for the structured line first, then fall back to colour words.
-        level = "unknown"
-        for line in out.splitlines():
-            line_l = line.lower()
-            if "system memory pressure" in line_l:
-                if "critical" in line_l:
-                    level = "critical"
-                elif "warn" in line_l:
-                    level = "warn"
-                elif "normal" in line_l or "ok" in line_l:
-                    level = "normal"
-                break
+        if level is None:
+            # sysctl absent or returned a value outside the documented encoding;
+            # fall back to the CLI tool.
+            source = "memory_pressure"
+            rc, out, _ = self.shell(["memory_pressure"])
+            if rc != 0 or not out:
+                return self._info("Could not read memory pressure")
+            level = _classify_memory_pressure_output(out)
+            if level is None:
+                return self._info(f"Memory pressure: {out.strip()[:80]}", data={"source": source})
 
-        # Fallback: look for colour words when the structured line is absent.
-        if level == "unknown":
-            if "red" in out_lower:
-                level = "critical"
-            elif "yellow" in out_lower:
-                level = "warn"
-            elif "green" in out_lower or "normal" in out_lower:
-                level = "normal"
-
+        data = {"source": source, "level": level}
         if level == "critical":
-            return self._critical("Memory pressure is RED — system is actively swapping")
+            return self._critical("Memory pressure is RED — RAM is exhausted", data=data)
         if level == "warn":
-            return self._warning("Memory pressure is YELLOW — RAM is running low")
-        if level == "normal":
-            return self._pass("Memory pressure is normal (Green)")
-        return self._info(f"Memory pressure: {out.strip()[:80]}")
+            return self._warning("Memory pressure is YELLOW — RAM is running low", data=data)
+        return self._pass("Memory pressure is normal (Green)", data=data)
 
 
 # ── Swap usage ────────────────────────────────────────────────────────────────
