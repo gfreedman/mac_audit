@@ -1,11 +1,13 @@
 """Homebrew package manager health and maintenance checks.
 
-This module audits the state of the Homebrew package manager across five
+This module audits the state of the Homebrew package manager across six
 dimensions:
 
 1. **Installation health** (``HomebrewDoctorCheck``) — Runs ``brew doctor``
-   to detect broken symlinks, PATH conflicts, stale git state, and other
-   issues that cause silent failures in package management.
+   to detect broken symlinks, PATH conflicts, untrusted taps, stale git
+   state, and other issues that cause silent failures in package management.
+   Output is parsed into structured ``DoctorWarning`` blocks so that known
+   warnings can be paired with exact remediation commands.
 
 2. **Outdated formulae** (``HomebrewOutdatedCheck``) — Identifies CLI tools
    and libraries with available updates. Stale packages may carry unpatched
@@ -35,9 +37,17 @@ Design decisions:
       this deliberately limited scope.
     - Dry-run flags (``--dry-run``) are used wherever available to avoid
       side effects during an audit pass.
-    - The ``import re`` inside ``HomebrewCleanupCheck.run`` is intentional:
-      ``re`` is only needed in that one method, and keeping it local avoids
-      polluting the module namespace given that most other checks don't use it.
+    - Output parsing lives in module-level pure functions
+      (``_parse_doctor_warnings`` and friends) rather than inside ``run()``,
+      so it can be unit-tested against captured ``brew doctor`` text without
+      spawning a subprocess.
+    - No check here ever *executes* a command built from ``brew`` output.
+      Text lifted from that output is only shown to the user. All of it is
+      stripped of ANSI escapes and control characters; tap and package names
+      that are interpolated into suggested commands are additionally
+      validated against strict allow-list regexes, so a suggested command
+      cannot be altered by unexpected characters. Free-text warning titles
+      are not allow-listed — the fix UI escapes them for display instead.
 
 Attributes:
     _BREW_MISSING_MSG (str): Standard skip message emitted by the base class
@@ -46,6 +56,10 @@ Attributes:
     ALL_CHECKS (list[type[BaseCheck]]): Ordered list of check classes exported
         to the main runner. Consumed by ``macaudit/main.py`` at startup.
 """
+
+import re
+from dataclasses import dataclass, replace
+from typing import Any
 
 from macaudit.checks.base import BaseCheck, CheckResult
 from macaudit.constants import BREW_CACHE_WARNING_MB
@@ -81,34 +95,348 @@ class _HomebrewBase(BaseCheck):
     profile_tags = ["developer", "creative", "standard"]
 
 
+@dataclass(frozen=True)
+class DoctorWarning:
+    """One ``Warning:`` block parsed out of ``brew doctor`` output.
+
+    ``brew doctor`` prints each diagnostic as a ``Warning: <title>`` line
+    followed by free-form explanatory lines (indented item lists, prose, and
+    the commands Homebrew suggests). This record keeps the two parts separate
+    so callers can match on the title and mine the body for specifics.
+
+    Note:
+        A block is one *diagnostic method*, not necessarily one problem:
+        Homebrew joins every finding from a single method under one
+        ``Warning:`` line (e.g. several broken symlinks, or several untrusted
+        taps). Counting blocks therefore gives a lower bound on the number of
+        underlying issues.
+
+    Attributes:
+        title (str): Text of the ``Warning:`` line with the prefix removed and
+            control characters stripped, e.g.
+            ``"The following taps are not trusted:"``.
+        details (tuple[str, ...]): Every line after the title up to (but not
+            including) the next block, right-stripped but with leading
+            indentation preserved — indentation is how ``brew doctor``
+            distinguishes item lists from prose. A tuple (not a list) so the
+            frozen dataclass is genuinely immutable and hashable.
+    """
+
+    title: str
+    details: tuple[str, ...]
+
+
+# Prefix that opens every diagnostic block in `brew doctor` output. Homebrew
+# prints it at column 0; an indented occurrence is body text, not a new block.
+_DOCTOR_WARNING_PREFIX = "Warning:"
+
+# Title of the tap-trust diagnostic (Homebrew's `check_for_untrusted_taps`,
+# https://docs.brew.sh/Tap-Trust). Matched case-insensitively as a prefix so
+# minor punctuation changes upstream do not break detection.
+_UNTRUSTED_TAPS_TITLE = "the following taps are not trusted"
+
+# Environment passed to `brew doctor`. Colour is disabled so warning labels
+# arrive as plain "Warning:" rather than "\x1b[4;33mWarning\x1b[0m:"; the
+# ANSI stripping in `_parse_doctor_warnings` is a second line of defence for
+# Homebrew versions or configurations that ignore this variable.
+_BREW_DOCTOR_ENV = {"HOMEBREW_NO_COLOR": "1"}
+
+# Matches ANSI CSI escape sequences (colours, cursor movement) and any other
+# C0 control character except tab. Applied to all `brew doctor` text before
+# parsing so escape codes can neither defeat prefix matching nor leak into the
+# report, the fix UI, or `--json` output.
+_CONTROL_CHARS_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|[\x00-\x08\x0b-\x1f\x7f]")
+
+# Allow-lists for names lifted from `brew doctor` output. These names are
+# interpolated into commands we *display* to the user for copy-paste; they are
+# never executed by macaudit. Validating them anyway guarantees that an
+# unexpected name (containing `;`, spaces, `..`, or a leading `-` that would be
+# parsed as a flag) can never turn a suggested command into something else.
+# Each path component must start with an alphanumeric character.
+#   Tap:    <user>/<repo>             e.g. gfreedman/mactuner
+#   Item:   <user>/<repo>/<name>      e.g. gfreedman/mactuner/mactuner
+# Formula names may contain `@` (versioned, e.g. python@3.12) and `+`.
+_NAME_COMPONENT = r"[A-Za-z0-9][A-Za-z0-9_.-]*"
+_TAP_NAME_RE = re.compile(rf"^{_NAME_COMPONENT}/{_NAME_COMPONENT}$")
+_ITEM_NAME_RE = re.compile(rf"^{_NAME_COMPONENT}/{_NAME_COMPONENT}/[A-Za-z0-9][A-Za-z0-9_.@+-]*$")
+
+# A Homebrew-suggested trust command for installed items. Homebrew emits one
+# such line per item kind, listing *every* installed item across all untrusted
+# taps, space-separated and sorted:
+#   brew trust --formula a/b/x a/b/y c/d/z
+#   brew trust --cask    a/b/some-app
+# Group 1 is the kind; group 2 is the raw, not-yet-validated name list.
+_TRUST_ITEMS_RE = re.compile(r"^\s+brew trust --(formula|cask) (.+?)\s*$")
+
+# Maximum characters of a single summary fragment in the one-line report
+# message. Keeps the report row readable; full text is kept in `data`.
+_SUMMARY_MAX = 60
+
+
+def _clean(text: str) -> str:
+    """Remove ANSI escape sequences and control characters from ``text``.
+
+    Args:
+        text (str): Raw text from a subprocess.
+
+    Returns:
+        str: ``text`` with every match of ``_CONTROL_CHARS_RE`` deleted.
+        Newlines and tabs are preserved.
+    """
+    return _CONTROL_CHARS_RE.sub("", text)
+
+
+def _truncate(text: str, limit: int = _SUMMARY_MAX) -> str:
+    """Shorten ``text`` to at most ``limit`` characters, marking any cut with ``…``.
+
+    Args:
+        text (str): Text to shorten.
+        limit (int): Maximum length of the returned string, including the
+            ellipsis. Must be >= 1.
+
+    Returns:
+        str: ``text`` unchanged if it fits, else its first ``limit - 1``
+        characters followed by ``"…"``.
+    """
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _parse_doctor_warnings(output: str) -> list[DoctorWarning]:
+    """Split raw ``brew doctor`` output into structured warning blocks.
+
+    ``brew doctor`` writes its diagnostics to **stderr** in the shape::
+
+        <preamble: "Please note that these warnings are just used ...">
+        Warning: <title 1>
+          <details 1 ...>
+        Warning: <title 2>
+          <details 2 ...>
+
+    Any text before the first ``Warning:`` line is boilerplate and is
+    discarded. Each column-0 ``Warning:`` line opens a new block; every
+    following line belongs to that block until the next such line or end of
+    input.
+
+    This is a pure function (no I/O) so it can be unit-tested exhaustively
+    against captured Homebrew output.
+
+    Args:
+        output (str): One stream of ``brew doctor`` output — normally stderr.
+            Do not pass stdout and stderr concatenated: stdout carries an
+            unrelated trailer (the support-tier notice) that would be
+            appended to whichever block happened to come last.
+
+    Returns:
+        list[DoctorWarning]: One entry per ``Warning:`` line, in output order.
+        Empty if the output contains no warnings.
+
+    Complexity:
+        O(n) in the length of ``output``: one regex pass to clean it, then a
+        single pass over its lines with no backtracking.
+    """
+    warnings: list[DoctorWarning] = []
+
+    # Accumulators for the block currently being read. `title is None` means
+    # we are still in the preamble and have not seen a Warning: line yet.
+    title: str | None = None
+    details: list[str] = []
+
+    # splitlines() also treats "\r\n" and lone "\r" as line breaks, so CRLF
+    # output needs no special handling.
+    for line in _clean(output).splitlines():
+        if line.startswith(_DOCTOR_WARNING_PREFIX):
+            # A new block begins — flush the previous one (if any) first.
+            if title is not None:
+                warnings.append(DoctorWarning(title, tuple(details)))
+            title = line[len(_DOCTOR_WARNING_PREFIX):].strip()
+            details = []
+        elif title is not None:
+            # rstrip only: leading indentation marks list items (see
+            # `_parse_untrusted_taps`) and must survive.
+            details.append(line.rstrip())
+
+    # The loop flushes a block only when the *next* one starts, so the final
+    # block is still pending here.
+    if title is not None:
+        warnings.append(DoctorWarning(title, tuple(details)))
+
+    return warnings
+
+
+def _is_untrusted_taps_warning(warning: DoctorWarning) -> bool:
+    """Return ``True`` if ``warning`` is Homebrew's tap-trust diagnostic.
+
+    Args:
+        warning (DoctorWarning): A parsed ``brew doctor`` warning block.
+
+    Returns:
+        bool: Whether the block's title identifies it as the untrusted-taps
+        warning.
+    """
+    return warning.title.lower().startswith(_UNTRUSTED_TAPS_TITLE)
+
+
+def _parse_untrusted_taps(
+    warning: DoctorWarning,
+) -> tuple[list[str], dict[str, list[str]]]:
+    """Extract untrusted tap names and the items installed from each.
+
+    The tap-trust warning body looks like::
+
+          gfreedman/mactuner                      <- tap list (indented)
+                                                  <- blank line ends list
+        Homebrew is currently ignoring ...
+        Trust installed formulae from these taps with:
+          brew trust --formula gfreedman/mactuner/mactuner
+        Trust installed casks from these taps with:
+          brew trust --cask gfreedman/mactuner/some-app
+        ...
+
+    Two facts are extracted:
+
+    1. **Tap names** — the indented lines immediately after the title, up to
+       the first blank or unindented line.
+    2. **Installed items** — every fully-qualified name on the
+       ``brew trust --formula`` and ``brew trust --cask`` lines. Homebrew
+       emits these only for formulae/casks that are actually installed, and
+       puts all installed items of one kind on a *single* line
+       (``diagnostic.rb``: ``formulae.sort.join(" ")``). Placeholder lines
+       such as ``brew trust --cask <user>/<tap>/<cask>`` fail validation and
+       are ignored.
+
+    Every extracted name is checked against a strict allow-list regex and
+    silently dropped if it does not match (see ``_TAP_NAME_RE``).
+
+    Args:
+        warning (DoctorWarning): A block for which
+            ``_is_untrusted_taps_warning`` returned ``True``.
+
+    Returns:
+        tuple[list[str], dict[str, list[str]]]: ``(taps, items_by_tap)``.
+        ``taps`` preserves output order. ``items_by_tap`` maps each tap to
+        the trust commands' arguments for it, as ``"--formula <full name>"``
+        or ``"--cask <full name>"`` strings in output order; taps with nothing
+        installed map to an empty list.
+    """
+    taps: list[str] = []
+    for line in warning.details:
+        if not line.strip() or not line[:1].isspace():
+            break  # A blank or unindented line terminates the tap list.
+        name = line.strip()
+        if _TAP_NAME_RE.match(name):
+            taps.append(name)
+
+    items_by_tap: dict[str, list[str]] = {tap: [] for tap in taps}
+    for line in warning.details:
+        match = _TRUST_ITEMS_RE.match(line)
+        if not match:
+            continue
+        kind, names = match.groups()
+        for full_name in names.split():
+            if not _ITEM_NAME_RE.match(full_name):
+                continue
+            # <user>/<repo>/<item>: everything before the last "/" is the tap.
+            tap = full_name.rpartition("/")[0]
+            if tap in items_by_tap:
+                items_by_tap[tap].append(f"--{kind} {full_name}")
+
+    return taps, items_by_tap
+
+
+def _untrusted_tap_steps(taps: list[str], items_by_tap: dict[str, list[str]]) -> list[str]:
+    """Build copy-pasteable remediation steps for untrusted taps.
+
+    For each tap the user has two legitimate choices, and macaudit cannot know
+    which one they want, so both are offered — removal first, because an
+    untrusted tap is a security gate and removing unused code is the safer
+    default:
+
+    - **Remove it** — ``brew untap --force <tap>``, which (per
+      ``brew untap --help``) uninstalls every formula and cask from the tap
+      before untapping. Plain ``brew untap`` refuses while any are installed.
+    - **Keep it** — trust only the specific installed items (Homebrew's own
+      recommended least-privilege option). Omitted when nothing from the tap
+      is installed: an unused tap has nothing worth trusting.
+
+    Each step is formatted as prose, a newline, then the command indented to
+    sit under the step text, so the command can be copied on its own.
+
+    Args:
+        taps (list[str]): Validated tap names, e.g. ``["gfreedman/mactuner"]``.
+        items_by_tap (dict[str, list[str]]): Trust arguments per tap, as
+            returned by ``_parse_untrusted_taps``.
+
+    Returns:
+        list[str]: Ordered steps — two per tap with installed items, one per
+        tap without. The caller appends a shared verification step.
+    """
+    # Width of the "  N.  " step prefix used by the fix UI, so a continuation
+    # line lines up under the step text.
+    indent = " " * 6
+    steps: list[str] = []
+    for tap in taps:
+        items = items_by_tap.get(tap, [])
+        if items:
+            steps.append(
+                f"Remove {tap} and everything installed from it:\n"
+                f"{indent}brew untap --force {tap}"
+            )
+            # One trust command per item keeps each line short and lets the
+            # user trust some items without the others.
+            trust_cmds = "\n".join(f"{indent}brew trust {item}" for item in items)
+            steps.append(
+                f"Or, to keep using it, trust only what you have installed:\n{trust_cmds}"
+            )
+        else:
+            steps.append(f"Nothing from {tap} is installed — remove it:\n{indent}brew untap {tap}")
+    return steps
+
+
 class HomebrewDoctorCheck(_HomebrewBase):
     """Verify Homebrew installation health by running ``brew doctor``.
 
     ``brew doctor`` is Homebrew's canonical self-diagnosis command. It checks
     for: stale symlinks in ``/opt/homebrew/bin`` (or ``/usr/local/bin``),
     conflicting ``$PATH`` entries, outdated Homebrew core tap state, invalid
-    ``HOMEBREW_*`` environment variables, and other conditions that silently
-    break package installs or cause hard-to-diagnose "command not found" errors.
+    ``HOMEBREW_*`` environment variables, untrusted third-party taps, and
+    other conditions that silently break package installs or cause
+    hard-to-diagnose "command not found" errors.
 
     Detection mechanism:
-        Shells out to ``brew doctor`` with a 30-second timeout. Exit code 0
-        or the string ``"ready to brew"`` in the combined stdout/stderr output
-        indicates health. Any line beginning with ``"Warning:"`` is extracted
-        and counted to give an actionable issue count.
+        Shells out to ``brew doctor`` (colour disabled) with a 30-second
+        timeout. Exit status is authoritative: Homebrew exits non-zero if and
+        only if at least one diagnostic fired. On failure, stderr — where
+        Homebrew writes every warning — is parsed into ``Warning:`` blocks by
+        ``_parse_doctor_warnings``.
+
+    Remediation:
+        ``brew doctor`` is purely diagnostic — re-running it changes nothing —
+        so this check is ``instructions`` rather than ``auto``. (It was
+        previously ``auto`` with ``fix_command = ["brew", "doctor"]``, which
+        made ``macaudit --fix --auto`` report a successful "fix" that left
+        every issue in place.) Known warnings get specific, per-result steps:
+
+        - **Untrusted taps** — the exact ``brew untap`` / ``brew trust``
+          commands for each tap and the items installed from it.
+        - **Anything else** — a pointer to the named warning in
+          ``brew doctor``'s output, which prints its own fix beneath it.
 
     Severity scale:
-        - ``pass``: ``brew doctor`` exits 0 or reports "ready to brew".
-        - ``warning``: One or more ``Warning:`` lines are found in the output.
+        - ``pass``: ``brew doctor`` exits 0.
+        - ``warning``: Non-zero exit (one or more diagnostics fired).
+        - ``error``: ``brew doctor`` could not be run to completion
+          (timeout, or binary vanished after the ``requires_tool`` check).
 
     Attributes:
         id (str): ``"homebrew_doctor"``
         name (str): ``"Homebrew Health (brew doctor)"``
-        fix_level (str): ``"auto"`` — the fix command is ``brew doctor`` itself;
-            it prints specific remediation steps for each warning it finds.
-        fix_command (list[str]): ``["brew", "doctor"]``
-        fix_reversible (bool): ``True`` — running ``brew doctor`` makes no
-            destructive changes; it only reports issues.
-        fix_time_estimate (str): Typically completes in under 30 seconds.
+        fix_level (str): ``"instructions"`` — steps are printed; nothing is
+            executed. Each fix changes Homebrew state in a way only the user
+            can choose (e.g. trust vs. remove a tap).
+        fix_steps (list[str]): Generic fallback steps. Replaced per-result
+            with targeted steps when warnings are parsed.
+        fix_reversible (bool): ``True`` — printing steps changes nothing.
+        fix_time_estimate (str): Typical time to read and apply the steps.
     """
 
     id = "homebrew_doctor"
@@ -116,7 +444,8 @@ class HomebrewDoctorCheck(_HomebrewBase):
 
     scan_description = (
         "Running 'brew doctor' — checks for common Homebrew issues like "
-        "broken symlinks, PATH conflicts, and stale installation state."
+        "broken symlinks, PATH conflicts, untrusted taps, and stale "
+        "installation state."
     )
     finding_explanation = (
         "Homebrew issues cause 'command not found' errors, broken installs, "
@@ -124,63 +453,119 @@ class HomebrewDoctorCheck(_HomebrewBase):
         "way to surface them."
     )
     recommendation = (
-        "Follow the instructions from 'brew doctor' to fix each issue. "
-        "Most fixes are one-liners it prints for you."
+        "Run 'brew doctor' and apply the command it prints beneath each "
+        "warning. Most fixes are one-liners."
     )
-    fix_level = "auto"
-    fix_description = "Runs 'brew doctor' and follows its suggestions"
-    fix_command = ["brew", "doctor"]
+    fix_level = "instructions"
+    fix_description = "Shows the specific commands that resolve each brew doctor warning"
+    fix_steps = [
+        "Run 'brew doctor' in Terminal.",
+        "For each 'Warning:' it prints, run the fix command shown beneath it.",
+        "Re-run 'brew doctor' until it reports 'Your system is ready to brew.'",
+    ]
     fix_reversible = True
-    fix_time_estimate = "~30 seconds"
+    fix_time_estimate = "~2 minutes"
 
     def run(self) -> CheckResult:
-        """Run ``brew doctor`` and count ``Warning:`` lines in the output.
-
-        Merges stdout and stderr before checking for ``"ready to brew"`` and
-        extracting warning lines. This handles Homebrew versions that write
-        warnings to stderr and those that write them to stdout.
+        """Run ``brew doctor`` and turn its warnings into actionable steps.
 
         Returns:
             CheckResult: One of:
 
-            - ``pass`` — Exit code 0 or "ready to brew" present in output.
-            - ``warning`` — One or more lines starting with ``"Warning:"``
-              were found. ``result.data["warnings"]`` contains the extracted
-              warning text list.
-            - ``warning`` — Non-zero exit and no parseable warnings; a 300-
-              character preview of raw output is included in ``result.data``.
+            - ``pass`` — ``brew doctor`` exited 0.
+            - ``error`` — ``shell()`` reported rc ``-1`` (timeout or the
+              binary could not be executed); this is a failure to *check*,
+              not a finding about Homebrew.
+            - ``warning`` — Non-zero exit. ``fix_steps`` is replaced with
+              targeted steps when ``Warning:`` blocks were parsed; otherwise
+              the generic class-level steps apply. ``result.data`` always
+              carries the same three keys so ``--json`` consumers need no
+              branching:
+
+              - ``"warnings"`` (list[str]): each full ``Warning:`` line
+                (format unchanged from earlier releases).
+              - ``"untrusted_taps"`` (list[str]): untrusted tap names.
+              - ``"output_preview"`` (str): first 300 cleaned characters of
+                output; populated only when no warning could be parsed.
 
         Example::
 
             check = HomebrewDoctorCheck()
             result = check.run()
-            # pass: "Homebrew is healthy"
-            # warning: "3 Homebrew issues found — run 'brew doctor'"
+            # pass:    "Homebrew is healthy"
+            # warning: "Homebrew: Untrusted tap gfreedman/mactuner"
+            # warning: "2 Homebrew warnings — untrusted tap a/b; Broken symlinks…"
         """
-        rc, stdout, stderr = self.shell(["brew", "doctor"], timeout=30)
+        rc, stdout, stderr = self.shell(
+            ["brew", "doctor"], timeout=30, env=_BREW_DOCTOR_ENV
+        )
 
-        output = (stdout + stderr).strip()
-
-        if rc == 0 or "ready to brew" in output.lower():
+        if rc == 0:
             return self._pass("Homebrew is healthy")
+        if rc == -1:
+            # `shell()` uses -1 exclusively for "could not run"; stderr then
+            # holds its own description (e.g. "Command timed out after 30s").
+            return self._error(f"Could not run brew doctor: {_truncate(_clean(stderr))}")
 
-        # Collect warning lines — these are the actionable items.
-        warnings = [
-            ln.strip()
-            for ln in output.splitlines()
-            if ln.strip().startswith("Warning:")
-        ]
+        # Warnings are written to stderr. Fall back to stdout only if stderr
+        # held none, to tolerate a hypothetical future change of stream.
+        warnings = _parse_doctor_warnings(stderr) or _parse_doctor_warnings(stdout)
 
-        if warnings:
-            n = len(warnings)
-            return self._warning(
-                f"{n} Homebrew issue{'s' if n != 1 else ''} found — run 'brew doctor'",
-                data={"warnings": warnings},
-            )
+        data: dict[str, Any] = {"warnings": [], "untrusted_taps": [], "output_preview": ""}
 
-        return self._warning(
-            "brew doctor reported issues",
-            data={"output_preview": output[:300]},
+        if not warnings:
+            data["output_preview"] = _clean(f"{stderr}\n{stdout}".strip())[:300]
+            return self._warning("brew doctor reported issues", data=data)
+
+        # Build one short summary and one group of steps per warning block.
+        # Untrusted taps are handled specifically; everything else defers to
+        # the instructions `brew doctor` already printed under the warning.
+        summaries: list[str] = []
+        steps: list[str] = []
+
+        for w in warnings:
+            data["warnings"].append(f"{_DOCTOR_WARNING_PREFIX} {w.title}".rstrip())
+            taps: list[str] = []
+            items_by_tap: dict[str, list[str]] = {}
+            if _is_untrusted_taps_warning(w):
+                taps, items_by_tap = _parse_untrusted_taps(w)
+            if taps:
+                data["untrusted_taps"].extend(taps)
+                plural = "s" if len(taps) != 1 else ""
+                summaries.append(_truncate(f"untrusted tap{plural} {', '.join(taps)}"))
+                steps.extend(_untrusted_tap_steps(taps, items_by_tap))
+            else:
+                # Unrecognised warning, or a tap warning whose names all
+                # failed validation: point the user at it by title. The title
+                # is control-character-free (`_clean`) but otherwise
+                # unvalidated free text; the fix UI escapes it for display.
+                summaries.append(_truncate(w.title.rstrip(":.")))
+                steps.append(
+                    f"Run 'brew doctor' and apply the fix it prints under "
+                    f"\"Warning: {_truncate(w.title)}\""
+                )
+        steps.append("Re-run 'brew doctor' to confirm every warning is gone.")
+
+        n = len(warnings)
+        if n == 1:
+            # Capitalise the first letter only; `str.capitalize` would
+            # lowercase the rest and mangle names like "Org/Tap".
+            message = f"Homebrew: {summaries[0][:1].upper()}{summaries[0][1:]}"
+        else:
+            # "warnings", not "issues": one block may hold several problems
+            # (see `DoctorWarning`), so the block count is a lower bound.
+            message = f"{n} Homebrew warnings — {'; '.join(summaries)}"
+
+        result = self._warning(message, data=data)
+        # `_result` copies class-level defaults; override just the fields
+        # that depend on what this run actually found.
+        return replace(
+            result,
+            fix_steps=steps,
+            recommendation=(
+                "Each Homebrew warning has a specific fix — follow the steps "
+                "below, then re-run 'brew doctor'."
+            ),
         )
 
 
@@ -561,7 +946,6 @@ class HomebrewCleanupCheck(_HomebrewBase):
         output = stdout + stderr
 
         # Parse "This operation would free X.XGB of disk space."
-        import re
         match = re.search(
             r"would free (\d+(?:\.\d+)?)\s*(B|KB|MB|GB|TB)",
             output,

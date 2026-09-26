@@ -389,6 +389,7 @@ class BaseCheck(ABC):
         self,
         cmd: list[str],
         timeout: int = 10,
+        env: dict[str, str] | None = None,
     ) -> tuple[int, str, str]:
         """Run a subprocess safely and return its exit code and output.
 
@@ -405,14 +406,18 @@ class BaseCheck(ABC):
             timeout (int): Maximum seconds to wait before aborting.
                 Defaults to 10.  Use a higher value only for known-slow
                 commands like ``softwareupdate -l``.
+            env (dict[str, str] | None): Extra environment variables for
+                this command only, e.g. ``{"HOMEBREW_NO_COLOR": "1"}``.
+                Merged over the inherited environment *before* the locale
+                override, so they cannot defeat ``LANG``/``LC_ALL=C``.
 
         Returns:
             tuple[int, str, str]: A three-element tuple of:
                 - ``returncode`` (int): The process exit code, or ``-1``
                   on timeout, binary not found, or other execution error.
-                - ``stdout`` (str): Stripped standard output string.
+                - ``stdout`` (str): Standard output, unstripped.
                   Never ``None``.
-                - ``stderr`` (str): Stripped standard error string, or
+                - ``stderr`` (str): Standard error, unstripped, or
                   a human-readable error description on failure.
                   Never ``None``.
 
@@ -432,7 +437,7 @@ class BaseCheck(ABC):
         """
         # Override locale variables to guarantee English output from system
         # tools, regardless of the user's configured system language.
-        _env = {**os.environ, "LANG": "C", "LC_ALL": "C"}
+        _env = {**os.environ, **(env or {}), "LANG": "C", "LC_ALL": "C"}
         try:
             result = subprocess.run(
                 cmd,
